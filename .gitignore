@@ -1,0 +1,41 @@
+# ─────────────────────────────────────────────────────────────
+# ALLOWLIST, NOT A DENYLIST.
+#
+# This working directory holds personal trading data alongside the source:
+# a portfolio, an options journal, capital and risk limits, a scan database,
+# and megabytes of cached market data. On a public repository a denylist is
+# one forgotten pattern away from publishing a holdings file permanently, so
+# everything is excluded by default and the source is added back explicitly.
+#
+# Adding a new data file requires no change here. Adding a new source file
+# that is not a top-level .py DOES — which is the safe direction to fail.
+# ─────────────────────────────────────────────────────────────
+
+# Exclude everything, including directories (git will not descend into an
+# excluded directory, so venv/, cache/, finra_cache/ and their contents are
+# unreachable and cannot be re-included by the rules below).
+*
+
+# ── Re-include the source ──
+!*.py
+!.gitignore
+!README.md
+
+# ── Never, under any circumstance ──
+# Redundant against the `*` above; kept explicit so the intent survives any
+# future edit that loosens the allowlist.
+portfolio.xlsx
+options_journal.csv
+trading_config.json
+rush_algos.db
+learned_params.json
+squeeze_log*.csv
+scenario_log*.csv
+stock_log.csv
+squeeze_snapshots*.json
+catalyst_cache*.json
+grading_status.json
+grading_runs.log
+scoring_config.json
+squeeze_*_*.csv
+scratch_*.txt
