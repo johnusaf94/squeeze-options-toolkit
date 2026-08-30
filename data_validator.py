@@ -57,6 +57,9 @@ class ValidatedDict(dict):
     missing:     list = None
     warnings:    list = None
     ticker_sym:  str  = ""
+    alive:       bool = True     # tape has prints and liquidity
+    zombie:      bool = False    # trades, but DTC pinned at the 60 cap
+    liveness_reasons: list = None
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -70,6 +73,11 @@ class ValidatedDict(dict):
         self.missing      = []
         self.warnings     = []
         self.ticker_sym   = ""
+        # Default to alive: absence of history is unknown, not dead. Only
+        # positive evidence of a stopped tape flips this.
+        self.alive        = True
+        self.zombie       = False
+        self.liveness_reasons = []
 
     def assess(self, ticker: str = ""):
         """Assess data quality and set attributes."""
@@ -117,6 +125,28 @@ class ValidatedDict(dict):
         else:
             self.confidence  = "LOW"
             self.can_analyze = False
+
+        # ── LIVENESS ──
+        # Every check above asks whether FIELDS are present. None of them ask
+        # whether the security still trades, which is why a name with no
+        # liquidity to enter or exit passed as HIGH confidence and went on to
+        # dominate the graded log. A dead tape makes every number above
+        # arithmetic on a corpse.
+        self.alive = True
+        self.zombie = False
+        self.liveness_reasons = []
+        try:
+            import liveness as _lv
+            _res = _lv.check(validated=self, hist=self.get('_history'),
+                             days_to_cover=self.get('shortRatio'))
+            self.alive = _res['alive']
+            self.zombie = _res['zombie']
+            self.liveness_reasons = _res['reasons']
+            if not self.alive:
+                self.can_analyze = False
+                self.confidence = "LOW"
+        except Exception:
+            pass
         return self
 
 @dataclass
@@ -323,7 +353,8 @@ def normalise_dividend_rate(info: dict) -> Optional[float]:
 # SHORT INTEREST NORMALISATION
 # ─────────────────────────────────────────────
 
-def normalise_short_interest(info: dict, ticker: str = "") -> dict:
+def normalise_short_interest(info: dict, ticker: str = "",
+                             enrich: bool = True) -> dict:
     """
     Return validated short interest metrics.
 
@@ -423,6 +454,10 @@ def normalise_short_interest(info: dict, ticker: str = "") -> dict:
     # one you are looking at so the two are never silently mixed.
     _tk = (ticker or info.get('symbol') or "").upper().strip()
     try:
+        # The cheap pass skips this network call and keeps the DTC computed
+        # from `info` above. Coarser vintage, but enough for a pre-filter.
+        if not enrich:
+            raise RuntimeError("skipped: cheap pass")
         import nasdaq_short_interest as _nsi
         official = _nsi.latest(_tk) if _tk else {}
     except Exception:
@@ -708,13 +743,38 @@ def calc_ctb_proxy(short_pct: float, dtc: Optional[float],
 # MASTER FETCH FUNCTION
 # ─────────────────────────────────────────────
 
-def fetch_validated_info(ticker: str) -> dict:
+def fetch_validated_info(ticker: str, enrich: bool = True) -> dict:
     """
     Fetch yfinance info for a ticker and return a fully validated,
     normalised data dictionary. Every field is guaranteed to be
     either a correctly-scaled value or None.
 
     This is the single source of truth for all analyzers.
+
+    ENRICH=FALSE — THE CHEAP PASS
+    -----------------------------
+    A bulk scan fetched everything for every name and then threw most of them
+    away on a short-interest threshold. Measured per ticker:
+
+        SEC fails-to-deliver        1.26s
+        FINRA settlement series     0.51s
+        Reg SHO threshold list      0.45s
+        yfinance info               0.34s   <- all the threshold needs
+        yfinance history            0.14s
+
+    87% of the cost was enrichment spent on names about to be discarded, and
+    over a 1,164-name universe that is the difference between a ~50 minute
+    scan and a ~10 minute one.
+
+    With enrich=False the network-expensive layers are skipped and their
+    fields come back None. Days-to-cover falls back to the value computable
+    from `info` alone, which is the mixed-vintage number the exchange feed
+    normally replaces — coarser, but the pre-filter is a loose threshold and
+    survivors are re-fetched with enrich=True (by then info and history are
+    in the throttle cache, so the second call pays only for enrichment).
+
+    Every key in the returned dict exists in both modes. Callers never have
+    to branch on which pass produced it.
     """
     import yfinance as yf
 
@@ -742,12 +802,46 @@ def fetch_validated_info(ticker: str) -> dict:
     if price is None and hist is not None and not hist.empty:
         price = float(hist['Close'].iloc[-1])
 
+    # ── CROSS-VALIDATE THE QUOTE AGAINST THE TAPE ──
+    # yfinance's info block stops updating for some thin or troubled names
+    # while history keeps printing correctly. Measured 2026-08-28:
+    #
+    #     SBNY   info currentPrice 0.95    history last close 0.16
+    #     MDRX   info currentPrice 4.74    history last close 4.81
+    #
+    # SBNY was logged at exactly $0.95 across 18 consecutive scans while the
+    # stock actually fell to $0.16. History was previously consulted ONLY
+    # when info was missing, never when it was wrong, so a frozen quote was
+    # copied into every downstream number — scan price, market cap,
+    # option moneyness — and then into the graded outcome log, where those
+    # rows produced fabricated returns that dominated every statistic
+    # computed from it.
+    #
+    # The tape is the authority. Same precedent as the market-cap check
+    # below: when the reported figure and the computed one disagree beyond
+    # a threshold, prefer the one derived from primary data.
+    price_source = 'info'
+    price_stale_ratio = None
+    if price and hist is not None and not hist.empty:
+        try:
+            last_close = float(hist['Close'].iloc[-1])
+            if last_close > 0:
+                ratio = max(price / last_close, last_close / price)
+                price_stale_ratio = ratio
+                if ratio > 1.15:
+                    price = last_close
+                    price_source = 'history_info_stale'
+        except (ValueError, TypeError, IndexError):
+            pass
+
     # ── Short interest (recalculated correctly) ──
-    si_data = normalise_short_interest(raw, ticker)
+    si_data = normalise_short_interest(raw, ticker, enrich=enrich)
 
     # ── FTD data (free from SEC) ──
     ftd_data = {'ftd_shares': None, 'ftd_pct_float': None, 'data_quality': 'not_fetched'}
     try:
+        if not enrich:
+            raise RuntimeError("skipped: cheap pass")
         float_shares = si_data.get('float_shares')
         ftd_raw = fetch_sec_ftd(ticker)
         if ftd_raw.get('ftd_shares') and float_shares:
@@ -802,6 +896,8 @@ def fetch_validated_info(ticker: str) -> dict:
     # existing scoring is unchanged. The robust variants are additional.
     dtc_data = {}
     try:
+        if not enrich:
+            raise RuntimeError("skipped: cheap pass")
         import dtc_engine
         _vol = hist["Volume"] if (hist is not None and not hist.empty) else None
         _hist_rows = si_data.get('settlement_history') or []
@@ -816,6 +912,59 @@ def fetch_validated_info(ticker: str) -> dict:
     _panel = dtc_data.get('panel') or {}
     _trends = dtc_data.get('trends') or {}
 
+    # ── BORROW AVAILABILITY / UTILIZATION ──
+    # The precondition the scanner has never been able to see: how much of
+    # the lendable pool is already lent. ctb_proxy is 0.875-correlated with
+    # short interest because it is computed from it; this is the real thing,
+    # when a source is configured. Returns available=False otherwise and
+    # costs nothing.
+    borrow = {}
+    try:
+        if not enrich:
+            raise RuntimeError("skipped: cheap pass")
+        import borrow_availability
+        borrow = borrow_availability.check(
+            ticker,
+            shares_short=si_data.get('shares_short'),
+            float_shares=si_data.get('float_shares'))
+    except Exception:
+        borrow = {}
+
+    # ── REG SHO THRESHOLD LIST (the official determination) ──
+    # The scanner previously reasoned about "threshold-security territory"
+    # from a percent-of-float band it computed itself, against SEC fail files
+    # that lag ~2 weeks. The exchange publishes the actual determination every
+    # session, and the consecutive-day count on that list is the mechanical
+    # clock: 13 sessions forces close-out of the fail position.
+    regsho = {}
+    try:
+        if not enrich:
+            raise RuntimeError("skipped: cheap pass")
+        import reg_sho
+        regsho = reg_sho.check(ticker)
+    except Exception:
+        regsho = {}
+
+    # ── CASH RUNWAY ──
+    # totalCash and freeCashflow were already fetched and reduced to a flat
+    # +8/+1 in fundamental scoring. Months of cash is the variable that
+    # actually matters for a squeeze: a company that runs out will issue
+    # shares into any spike, which is the standard way a squeeze becomes a
+    # permanent loss rather than a round trip.
+    total_cash = safe_float(raw, 'totalCash')
+    fcf_ttm = safe_float(raw, 'freeCashflow')
+    op_cf = safe_float(raw, 'operatingCashflow')
+    burn_annual = None
+    for _c in (fcf_ttm, op_cf):
+        if _c is not None and _c < 0:
+            burn_annual = abs(_c)
+            break
+    runway_months = None
+    if total_cash and total_cash > 0 and burn_annual and burn_annual > 0:
+        runway_months = total_cash / (burn_annual / 12.0)
+    elif total_cash and total_cash > 0 and burn_annual is None:
+        runway_months = float('inf')      # cash-generative, not burning
+
     # ── EFFECTIVE FLOAT (reported float less the shares that won't trade) ──
     # Reported float is the wrong denominator for a forced-buying event: it
     # still contains index and long-only positions that do not sell into a
@@ -826,6 +975,8 @@ def fetch_validated_info(ticker: str) -> dict:
     eff_data = {}
     ftd_pct_eff = None
     try:
+        if not enrich:
+            raise RuntimeError("skipped: cheap pass")
         from effective_float import compute_effective_float
         eff_data = compute_effective_float(
             si_data.get('float_shares'),
@@ -868,6 +1019,8 @@ def fetch_validated_info(ticker: str) -> dict:
 
         # Price
         'currentPrice':       price,
+        'priceSource':        price_source,
+        'priceStaleRatio':    price_stale_ratio,
         'marketCap':          mktcap,
         'sharesOutstanding':  shares_out,
 
@@ -918,6 +1071,31 @@ def fetch_validated_info(ticker: str) -> dict:
         'ftdReportDate':      ftd_data.get('report_date'),
         'ftdDataQuality':     ftd_data.get('data_quality'),
 
+        # Borrow availability (needs a configured source — see
+        # borrow_availability.py). borrowAvailable False means no source.
+        'borrowAvailable':    borrow.get('available', False),
+        'sharesAvailable':    borrow.get('shares_available'),
+        'borrowUtilization':  borrow.get('utilization'),
+        'borrowAvailPctFloat': borrow.get('avail_pct_float'),
+        'borrowRateReal':     borrow.get('borrow_rate'),
+        'borrowLenders':      borrow.get('lenders'),
+        'borrowState':        borrow.get('state', ''),
+        'borrowNearZero':     borrow.get('near_zero', False),
+        'borrowDraining':     borrow.get('draining', False),
+        'borrowDrainPct':     borrow.get('drain_pct'),
+
+        # Reg SHO threshold list (official, daily, same-session)
+        'regShoOnList':       regsho.get('on_list', False),
+        'regShoDays':         regsho.get('consecutive_days', 0),
+        'regShoMandatory':    regsho.get('mandatory_closeout', False),
+        'regShoDaysToMandatory': regsho.get('days_to_mandatory'),
+        'regShoAvailable':    regsho.get('available', False),
+        'regShoNote':         regsho.get('note', ''),
+
+        # Cash runway — months before a raise becomes necessary
+        'cashRunwayMonths':   runway_months,
+        'cashBurnAnnual':     burn_annual,
+
         # Effective float (reported float less locked institutional stock)
         'effectiveFloat':        eff_data.get('effective_float'),
         'effectiveFloatBand':    eff_data.get('effective_float_band'),
@@ -925,6 +1103,7 @@ def fetch_validated_info(ticker: str) -> dict:
         'effectiveFloatNotes':   eff_data.get('notes'),
         'floatTightness':        eff_data.get('tightness'),
         'instSharesOverFloat':   eff_data.get('inst_pct_of_float'),
+        'instCapped':            eff_data.get('inst_capped', False),
         'insiderShares':         eff_data.get('insider_shares'),
         'institutionalShares':   eff_data.get('institutional_shares'),
         'ftdPctEffFloat':        ftd_pct_eff,

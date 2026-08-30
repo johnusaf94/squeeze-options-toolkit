@@ -1739,6 +1739,31 @@ class SqueezeAnalyzerApp:
             metrics = fetch_squeeze_metrics(ticker)
             if metrics.fetch_errors:
                 self._sa_w(f"  ⚠️  {'; '.join(metrics.fetch_errors[:2])}\n", "yellow")
+
+            # ── LIVENESS ──
+            # The bulk searcher gates on this; the single-ticker path did not,
+            # so a deep dive on a name with no tape ran the full analysis and
+            # printed scores computed from nothing. Warn loudly and continue
+            # rather than refuse: the user asked for THIS ticker specifically,
+            # and the honest response is to say the numbers are not real, not
+            # to silently show a blank pane.
+            if not getattr(metrics, "alive", True):
+                self._sa_w(
+                    f"  ⛔ NOT TRADEABLE — "
+                    f"{'; '.join(getattr(metrics, 'liveness_reasons', []))}\n"
+                    f"     Every metric below is arithmetic on a dead tape.\n",
+                    "red")
+            elif getattr(metrics, "zombie", False):
+                self._sa_w(
+                    "  ⚠️  ZOMBIE — days-to-cover is pinned at the 60 cap, "
+                    "which is a data error rather than a measurement "
+                    "(0 winners in 21 graded episodes).\n", "yellow")
+            if getattr(metrics, "price_source", "") == "history_info_stale":
+                self._sa_w(
+                    f"  ⚠️  quote was stale by "
+                    f"{getattr(metrics, 'price_stale_ratio', 0):.1f}x — "
+                    f"corrected from the tape to "
+                    f"${metrics.current_price:g}\n", "yellow")
             self._sa_rule("📊 Short Interest Data")
             self._sa_w(f"  Company:  {metrics.company_name}\n", "blue")
             self._sa_w(f"  Sector:   {metrics.sector}\n", "dim")
@@ -1886,6 +1911,33 @@ class SqueezeAnalyzerApp:
                             "magnitude_v1": deep.magnitude_score_v1,
                             "ftd_score_v1": deep.ftd_score_v1,
                             "ftd_impact_factor_v1": deep.ftd_impact_factor_v1,
+                            "borrow_utilization": deep.borrow_utilization,
+                            "shares_available": deep.shares_available,
+                            "borrow_rate_real": deep.borrow_rate_real,
+                            "borrow_mult": deep.borrow_mult,
+                            "borrow_state": deep.borrow_state,
+                            "conviction_mult_raw": deep.conviction_mult_raw,
+                            "convexity_score": deep.convexity_score,
+                            "ctb_velocity_score": deep.ctb_velocity_score,
+                            "ftd_score": deep.ftd_score,
+                            "svr_score": (deep.svr_score if deep.svr_available else None),
+                            "momentum_score": (deep.momentum_score
+                                               if deep.momentum_available else None),
+                            "ret_5d": deep.ret_5d,
+                            "ret_20d": deep.ret_20d,
+                            "rel_volume": deep.rel_volume,
+                            "float_shares": deep.float_shares,
+                            "ctb_trend": deep.ctb_trend,
+                            "dtc_trend": deep.dtc_trend,
+                            "si_trend": deep.si_trend,
+                            "calibrated_prob": deep.calibrated_prob,
+                            "ftd_mult": deep.ftd_mult,
+                            "reg_sho_days": deep.reg_sho_days,
+                            "reg_sho_mult": deep.reg_sho_mult,
+                            "exhaustion_factor": deep.exhaustion_factor,
+                            "momentum_raw": deep.momentum_score_raw,
+                            "cash_runway_months": deep.cash_runway_months,
+                            "final_score_v1": deep.final_score_v1,
                             "dtc_exchange": deep.dtc_exchange,
                             "dtc_robust": deep.dtc_robust,
                             "dtc_60d": deep.dtc_60d,

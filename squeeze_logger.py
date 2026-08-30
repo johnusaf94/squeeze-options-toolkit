@@ -24,6 +24,17 @@ QUALITY_FIELDS = ["si_pct", "dtc", "ctb", "implied_move_pct",
                   "gex_net_musd", "svr_recent", "combined", "final_score"]
 
 
+def _num(v, nd):
+    """Round a numeric to nd places, or blank. Blank beats a fabricated 0 —
+    _completeness treats a scrubbed-to-zero field as missing for the same
+    reason."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return ""
+    if v != v or v in (float("inf"), float("-inf")):
+        return ""
+    return round(v, nd) if nd else int(v)
+
+
 def _completeness(row: dict) -> float:
     """Share of QUALITY_FIELDS that carry a real value in this row.
 
@@ -112,11 +123,53 @@ LOG_COLUMNS = [
     "magnitude_v1",
     "ftd_score_v1",
     "ftd_impact_factor_v1",
+    "ftd_mult",
+    "final_score_v1",
+    # ── Signals added after the log audit ──
+    # Reg SHO is the official close-out clock; exhaustion records how much of
+    # the thrust score was a move that had already happened; runway is the
+    # dilution mechanism that turns a squeeze into a permanent loss.
+    "reg_sho_days",
+    "reg_sho_mult",
+    "exhaustion_factor",
+    "momentum_raw",
+    "cash_runway_months",
     # ── DTC by named volume window + settlement-cadence trend ──
     # `dtc` above is the exchange figure and stays that. These record which
     # denominator was used and what the alternatives said, so a future refit
     # can test whether a spike-robust or long-horizon DTC predicts better —
     # and so a disagreement with any vendor is resolvable from the log alone.
+    # ── THE FIVE DEEP SIGNALS ──
+    # These are what stage 2 actually computes, and every one of them feeds
+    # probability_score. None were logged, so every calibration run to date
+    # has been asking whether short interest and days-to-cover predict
+    # returns — never whether the scanner's own analysis does. The deep layer
+    # has never been evaluated because the grader could not see it.
+    # Undamped conviction, so the authority setting is itself testable:
+    # conviction_mult / conviction_mult_raw recovers the scale that was
+    # applied, and a refit can ask whether damping helped.
+    # Borrow availability — blank until a source is configured, which is
+    # honest: the column records that the precondition was unmeasured, not
+    # that borrow was plentiful.
+    "borrow_utilization",
+    "shares_available",
+    "borrow_rate_real",
+    "borrow_mult",
+    "borrow_state",
+    "conviction_mult_raw",
+    "convexity_score",
+    "ctb_velocity_score",
+    "ftd_score",
+    "svr_score",
+    "momentum_score",
+    "ret_5d",
+    "ret_20d",
+    "rel_volume",
+    "float_shares",
+    "ctb_trend",
+    "dtc_trend",
+    "si_trend",
+    "calibrated_prob",
     "dtc_exchange",
     "dtc_robust",
     "dtc_60d",
@@ -295,6 +348,46 @@ def log_scan(candidates: list, tier: int, top_n: int = 25,
                     "ftd_impact_factor_v1": (round(c["ftd_impact_factor_v1"], 3)
                                              if isinstance(c.get("ftd_impact_factor_v1"),
                                                            (int, float)) else ""),
+                    "reg_sho_days":     c.get("reg_sho_days", ""),
+                    "reg_sho_mult":     (round(c["reg_sho_mult"], 4)
+                                         if isinstance(c.get("reg_sho_mult"),
+                                                       (int, float)) else ""),
+                    "exhaustion_factor": (round(c["exhaustion_factor"], 3)
+                                          if isinstance(c.get("exhaustion_factor"),
+                                                        (int, float)) else ""),
+                    "momentum_raw":     (round(c["momentum_raw"], 2)
+                                         if isinstance(c.get("momentum_raw"),
+                                                       (int, float)) else ""),
+                    "cash_runway_months": (round(c["cash_runway_months"], 1)
+                                           if isinstance(c.get("cash_runway_months"),
+                                                         (int, float))
+                                           and c["cash_runway_months"] != float("inf")
+                                           else ""),
+                    "ftd_mult":         (round(c["ftd_mult"], 4)
+                                         if isinstance(c.get("ftd_mult"),
+                                                       (int, float)) else ""),
+                    "final_score_v1":   (round(c["final_score_v1"], 2)
+                                         if isinstance(c.get("final_score_v1"),
+                                                       (int, float)) else ""),
+                    "borrow_utilization": _num(c.get("borrow_utilization"), 4),
+                    "shares_available":  _num(c.get("shares_available"), 0),
+                    "borrow_rate_real":  _num(c.get("borrow_rate_real"), 2),
+                    "borrow_mult":       _num(c.get("borrow_mult"), 4),
+                    "borrow_state":      c.get("borrow_state", ""),
+                    "conviction_mult_raw": _num(c.get("conviction_mult_raw"), 4),
+                    "convexity_score":  _num(c.get("convexity_score"), 2),
+                    "ctb_velocity_score": _num(c.get("ctb_velocity_score"), 2),
+                    "ftd_score":        _num(c.get("ftd_score"), 2),
+                    "svr_score":        _num(c.get("svr_score"), 2),
+                    "momentum_score":   _num(c.get("momentum_score"), 2),
+                    "ret_5d":           _num(c.get("ret_5d"), 5),
+                    "ret_20d":          _num(c.get("ret_20d"), 5),
+                    "rel_volume":       _num(c.get("rel_volume"), 3),
+                    "float_shares":     _num(c.get("float_shares"), 0),
+                    "ctb_trend":        c.get("ctb_trend", ""),
+                    "dtc_trend":        c.get("dtc_trend", ""),
+                    "si_trend":         c.get("si_trend", ""),
+                    "calibrated_prob":  _num(c.get("calibrated_prob"), 4),
                     "dtc_exchange":     (round(c["dtc_exchange"], 3)
                                          if isinstance(c.get("dtc_exchange"),
                                                        (int, float)) else ""),
@@ -317,8 +410,18 @@ def log_scan(candidates: list, tier: int, top_n: int = 25,
                     "settlement_age_days": (c.get("settlement_age_days")
                                             if c.get("settlement_age_days") is not None
                                             else ""),
-                    "price_at_scan":    round(c.get("price", 0) or 0, 4),
-                    "market_cap":       c.get("mktcap", 0) or 0,
+                    # Blank, not 0. A zero price is a missing price, and a
+                    # zero market cap is a missing market cap — writing them
+                    # as 0 makes an absent field indistinguishable from a
+                    # real measurement, and _completeness() already treats a
+                    # scrubbed-to-zero field as missing for exactly this
+                    # reason. 9 rows carried price 0 and 18 carried mktcap 0.
+                    "price_at_scan":    (round(c["price"], 4)
+                                         if isinstance(c.get("price"), (int, float))
+                                         and c["price"] > 0 else ""),
+                    "market_cap":       (c["mktcap"]
+                                         if isinstance(c.get("mktcap"), (int, float))
+                                         and c["mktcap"] > 0 else ""),
                     # outcomes blank until review_outcomes.py runs
                     "price_5d":         "",
                     "return_5d":        "",

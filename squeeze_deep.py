@@ -58,6 +58,87 @@ _SCORING_DEFAULTS = {
     # local snapshots. See analyze_conviction_matrix for the measurement that
     # motivated this.
     "use_settlement_trends": True,
+    # ── FTD CLOSE-OUT MULTIPLIER ──
+    # A third multiplier on final_score, sized by how much of the float the
+    # forced buying represents. Ceiling only: a name with no fails is never
+    # punished, it simply gets 1.0. See _ftd_closeout_multiplier.
+    "use_ftd_multiplier":  True,
+    "ftd_mult_max":        1.25,
+    # ── EXHAUSTION ──
+    # _price_momentum is one-sided by design and pays up to 80 points for a
+    # move that already happened. Measured over 530 observations with dead
+    # tickers removed, forward 10d return falls monotonically as the prior
+    # 20d run rises: +6.58% / +4.09% / +2.40% / +0.98% across the <-20%,
+    # -20..0%, 0..+20%, +20..+50% buckets. Directional, not significant
+    # (binary split at +20% gives p=0.132), so the haircut is modest and
+    # switchable rather than a hard gate.
+    "use_exhaustion":      True,
+    "exhaustion_start":    0.20,   # prior 20d return where the haircut begins
+    "exhaustion_full":     0.60,   # ...and where it reaches its floor
+    "exhaustion_floor":    0.50,   # most momentum can be cut to
+    # Reg SHO threshold list. Reported always; scored only when on.
+    "use_reg_sho":         True,
+    "reg_sho_mult_max":    1.20,
+    # ── NO-CATALYST PENALTY ──
+    # The only finding in a long audit that was both significant AND stable
+    # across time. Episode level, dead tickers removed:
+    #
+    #   catalyst_window NONE   n=140   mean -4.64%   win 18.6%
+    #   has a catalyst         n=504   mean +0.87%   win 13.5%
+    #   difference -5.50pp, p=0.0026
+    #   first 60% of the sample: -4.59pp    last 40%: -3.92pp
+    #
+    # NONE currently receives 1.00 — identical to TOO_FAR, which measured
+    # +0.54%. Two states five points apart in outcome scored the same.
+    #
+    # CAVEAT, because it decides how hard to lean: this was one of roughly
+    # twenty comparisons run over the same log. A Bonferroni correction puts
+    # it right at the edge of significance. What earns it a place is not the
+    # p-value but that it held its sign and rough size in BOTH halves, which
+    # nothing else tested did. The penalty is therefore mild — a haircut, not
+    # the 0.55x that PASSED gets — and switchable.
+    "use_no_catalyst_penalty": True,
+    "no_catalyst_mult":        0.85,
+    # ── CONVICTION AUTHORITY ──
+    # How much of the ranking an unvalidated term is allowed to own.
+    #
+    # The conviction matrix controls 46-56% of final_score's variance
+    # (56.4% per row, 46.3% per episode) while stage-1 controls 6-11%.
+    # Multipliers were designed as adjustments and became the score.
+    #
+    # What the graded log says about whether it earns that:
+    #   Spearman(conviction_mult, return_10d) = -0.017, n=697
+    #   significance threshold at that n      = +/-0.076   -> noise
+    #   high-vs-low split: +2.76pp mean edge, 3 of 4 time blocks,
+    #                      sd 4.75pp -> t ~ 1.16, not significant
+    # So: unproven, NOT disproven. Its middle ranks correctly (LIQUIDITY
+    # TIGHTENING 1.10x -> +3.43%, EASING 0.80x -> +0.18%); its tails invert
+    # on 9-17 episode samples, which is far too thin to retune against.
+    #
+    # This shrinks the DEVIATION from neutral without reordering anything:
+    # 1.80 -> 1.48 and 0.60 -> 0.76 at 0.60. The ordering the matrix asserts
+    # is preserved; only its authority over the ranking is reduced to match
+    # the strength of the evidence for it.
+    #
+    # Distinct from learned_params' `conviction_effect_scale`, which the
+    # nightly refit owns and which answers a different question — whether
+    # the matrix over- or under-delivers against its own claim. That one is
+    # measured, this one is a prior about weight. They compose.
+    "conviction_authority":    0.60,
+    # ── BORROW EXHAUSTION ──
+    # Utilization at/near 100% means no shares left to borrow: new shorts
+    # cannot open and existing ones cannot roll. That is the textbook
+    # precondition, and the scanner has never been able to measure it.
+    # Scored only when a source is configured and the condition is present,
+    # so it can never penalise the ordinary case. UNVALIDATED against this
+    # repo's outcomes — there is no graded history with borrow data in it —
+    # so the ceiling is deliberately modest, matching reg_sho's treatment.
+    "use_borrow_exhaustion":   True,
+    "borrow_mult_max":         1.25,
+    # Bonus weight for the close-out being heavy against TRADEABLE float
+    # rather than reported float. Applied only where the effective-float
+    # number carries real information (see inst_capped).
+    "ftd_mult_eff_weight": 0.15,
     # Effective-float buckets for the magnitude pillar (shares).
     "eff_float_buckets":   [10e6, 25e6, 50e6, 150e6],
 }
@@ -171,6 +252,7 @@ class DeepSqueezeResult:
     magnitude_score_v1:     float = 0.0
     probability_score_v1:   float = 0.0
     deep_score_v1:          float = 0.0
+    final_score_v1:         float = 0.0   # before the FTD multiplier
 
     # ── CONVICTION MATRIX (CTB vel + DTC trend + SI trend) ──
     dtc_now:             Optional[float] = None
@@ -197,6 +279,7 @@ class DeepSqueezeResult:
     ctb_trend:           str = ""                  # RISING / FALLING / FLAT
     conviction_state:    str = ""                  # the matrix readout
     conviction_mult:     float = 1.0               # multiplier applied to combined
+    conviction_mult_raw: float = 1.0   # before learned scale and authority damping
 
     # ── CATALYST TIMING (the proven-edge layer) ──
     catalyst_window:     str = ""                  # SWEET_SPOT / PASSED / etc
@@ -204,6 +287,8 @@ class DeepSqueezeResult:
     catalyst_note:       str = ""
     days_to_earnings:    Optional[int] = None
     catalyst_mult:       float = 1.0               # timing multiplier on final
+    ftd_mult:            float = 1.0   # close-out SIZE multiplier on final
+    ftd_mult_basis:      str = ""      # why it is what it is
 
     final_score:         float = 0.0               # combined × conviction × catalyst
 
@@ -218,8 +303,30 @@ class DeepSqueezeResult:
     ret_5d:              Optional[float] = None
     ret_20d:             Optional[float] = None
     rel_volume:          Optional[float] = None
-    momentum_score:      float = 0.0    # 0-100 thrust detector
+    momentum_score:      float = 0.0    # 0-100 thrust detector (post-haircut)
+    momentum_score_raw:  float = 0.0    # before the exhaustion haircut
+    exhaustion_factor:   float = 1.0    # 1.0 = fresh, <1 = already ran
     momentum_available:  bool = False
+
+    # ── Borrow availability (the squeeze precondition) ──
+    borrow_available:    bool = False   # is a SOURCE configured
+    shares_available:    Optional[float] = None
+    borrow_utilization:  Optional[float] = None
+    borrow_rate_real:    Optional[float] = None
+    borrow_state:        str = ""
+    borrow_near_zero:    bool = False
+    borrow_draining:     bool = False
+    borrow_mult:         float = 1.0
+
+    # ── Reg SHO threshold list (official determination) ──
+    reg_sho_on_list:     bool = False
+    reg_sho_days:        int = 0
+    reg_sho_mandatory:   bool = False
+    reg_sho_days_to_mandatory: Optional[int] = None
+    reg_sho_mult:        float = 1.0
+
+    # ── Cash runway (dilution risk) ──
+    cash_runway_months:  Optional[float] = None
 
     flags:               list = field(default_factory=list)
     warnings:            list = field(default_factory=list)
@@ -287,11 +394,20 @@ def _price_momentum(result) -> None:
             result.warnings.append("price history unavailable — momentum "
                                    "signal skipped")
             return
-        closes = [float(x) for x in h["Close"]]
-        vols = [float(x) for x in h["Volume"]]
+        # A bar can exist with no print. NaN survives every arithmetic step
+        # below, lands in momentum_score, and from there into the probability
+        # signal list — where one unprintable session turns the whole
+        # composite into NaN with no error anywhere. Drop them.
+        closes = [float(x) for x in h["Close"] if x == x and float(x) > 0]
+        vols = [float(x) for x in h["Volume"] if x == x and float(x) >= 0]
+        if len(closes) < 8:
+            result.warnings.append(
+                "price history has too few printable sessions — momentum "
+                "signal skipped")
+            return
         result.ret_5d = closes[-1] / closes[-6] - 1.0
         result.ret_20d = closes[-1] / closes[0] - 1.0
-        avg_vol = sum(vols) / len(vols)
+        avg_vol = (sum(vols) / len(vols)) if vols else 0.0
         if avg_vol > 0:
             result.rel_volume = (sum(vols[-5:]) / 5.0) / avg_vol
         pts = 0.0
@@ -299,6 +415,31 @@ def _price_momentum(result) -> None:
         pts += min(max(result.ret_20d / 0.35, 0.0), 1.0) * 30.0
         if result.rel_volume is not None:
             pts += min(max((result.rel_volume - 1.0) / 1.5, 0.0), 1.0) * 20.0
+        result.momentum_score_raw = round(pts, 1)
+
+        # ── EXHAUSTION HAIRCUT ──
+        # Thrust and exhaustion are the same measurement read at different
+        # points. The scoring above cannot tell "igniting" from "already
+        # went", and pays full price for both. This trims the score as the
+        # prior run gets large — it never zeroes it, because a live squeeze
+        # genuinely does run, and the evidence is directional rather than
+        # conclusive.
+        cfg = _scoring_cfg()
+        result.exhaustion_factor = 1.0
+        if cfg.get("use_exhaustion", True) and result.ret_20d is not None:
+            lo = float(cfg.get("exhaustion_start", 0.20))
+            hi = float(cfg.get("exhaustion_full", 0.60))
+            floor = float(cfg.get("exhaustion_floor", 0.50))
+            if result.ret_20d > lo and hi > lo:
+                frac = min((result.ret_20d - lo) / (hi - lo), 1.0)
+                result.exhaustion_factor = round(1.0 - (1.0 - floor) * frac, 3)
+                pts *= result.exhaustion_factor
+                result.warnings.append(
+                    f"already ran {result.ret_20d:+.0%} over 20 sessions — "
+                    f"thrust cut to {result.exhaustion_factor:.0%} "
+                    f"({result.momentum_score_raw:.0f} -> {pts:.0f}). Forward "
+                    f"returns fall monotonically with prior run-up")
+
         result.momentum_score = round(pts, 1)
         result.momentum_available = True
         if pts >= 55:
@@ -1397,6 +1538,98 @@ def analyze_ftd_accumulation(ticker: str, ftd_shares: Optional[int],
 # CONVICTION MATRIX: CTB velocity + DTC trend + SI trend
 # ─────────────────────────────────────────────
 
+def _ftd_closeout_multiplier(result: DeepSqueezeResult) -> float:
+    """Multiplier on final_score sized by the close-out's impact on float.
+
+    WHY THIS EXISTS
+    ---------------
+    Float impact already scaled final_score, but through one narrow door: it
+    scaled the catalyst multiplier ONLY when the FTD close-out won the
+    catalyst merge AND landed in the sweet spot. Measured across six live
+    names, that door opened once. On the other five the close-out lost the
+    merge to earnings and its float impact reached the headline number not at
+    all — a name with a heavy fail load and earnings a week out was scored as
+    though the fails did not exist.
+
+    This gives the close-out its own multiplier so its SIZE counts even when
+    the catalyst layer is busy describing something else.
+
+    THREE RULES IT OBEYS
+    --------------------
+    1. NEVER punitive. The range is 1.0 upward. Absence of fails is absence
+       of evidence, not evidence against — and a scanner that marks names
+       down for clean settlement would rank the boring half of the universe
+       below names whose only distinction is a data outage.
+
+    2. NEVER stacks on the catalyst path. When catalyst_type is already
+       FTD_CLOSEOUT the catalyst multiplier has been scaled by the same
+       impact factor, so this returns 1.0 and says so. Two multipliers
+       reading one variable is the double-count this file has removed twice
+       before.
+
+    3. Effective float only where effective float MEANS something. Once 13F
+       holdings exceed the float the cap binds and effective float becomes
+       exactly float x (1 - locked_frac) — the same constant on every
+       heavily-lent name. Scoring that would dress a constant as a discovery,
+       so the tradeable-float bonus is skipped whenever inst_capped is set.
+    """
+    cfg = _scoring_cfg()
+    result.ftd_mult_basis = ""
+    if not cfg.get("use_ftd_multiplier", True):
+        result.ftd_mult_basis = "disabled in scoring_config.json"
+        return 1.0
+
+    fi = result.ftd_impact_factor or 0.0
+    if fi <= 0:
+        result.ftd_mult_basis = "no close-out above the noise floor"
+        return 1.0
+
+    # Rule 2 — the catalyst path already carries this variable.
+    if (result.catalyst_type or "").upper() == "FTD_CLOSEOUT":
+        result.ftd_mult_basis = (
+            "close-out already scored as the catalyst — multiplier withheld "
+            "to avoid double-counting float impact")
+        return 1.0
+
+    impact = fi
+
+    # Rule 3 — sharpen by tradeable float only where that number varies.
+    eff_w = float(cfg.get("ftd_mult_eff_weight", 0.15))
+    tight = result.float_tightness
+    if (eff_w > 0 and tight and tight > 1.05
+            and not getattr(result, "_inst_capped", False)):
+        lift = 1.0 + min(tight - 1.0, 2.0) * eff_w
+        impact = min(impact * lift, 1.0)
+        result.ftd_mult_basis = (
+            f"float impact {fi:.0%} lifted to {impact:.0%} — tradeable float "
+            f"is {tight:.1f}x smaller than reported")
+    elif getattr(result, "_inst_capped", False):
+        result.ftd_mult_basis = (
+            f"float impact {fi:.0%}; tradeable-float bonus skipped — 13F "
+            f"exceeds float, so effective float is a fixed fraction and "
+            f"carries no name-specific information")
+    else:
+        result.ftd_mult_basis = f"float impact {fi:.0%}"
+
+    # Timing decay. A close-out that has already passed, or is beyond the
+    # horizon anyone can position for, is not worth full size. Neutral rather
+    # than penalising when there is no projected window at all.
+    days = result.ftd_closeout_days
+    if days is not None:
+        if days < -5:
+            result.ftd_mult_basis += f"; window passed ({days}d) — withheld"
+            return 1.0
+        if days > 30:
+            impact *= 0.5
+            result.ftd_mult_basis += f"; {days}d out — halved for distance"
+        elif days > 15:
+            impact *= 0.75
+            result.ftd_mult_basis += f"; {days}d out — trimmed for distance"
+
+    ceiling = float(cfg.get("ftd_mult_max", 1.25))
+    return round(1.0 + (ceiling - 1.0) * max(0.0, min(impact, 1.0)), 4)
+
+
 def analyze_conviction_matrix(ticker: str,
                                 ctb_now: Optional[float],
                                 dtc_now: Optional[float],
@@ -1558,6 +1791,23 @@ def analyze_conviction_matrix(ticker: str,
     elif si_dn:
         state = "⬇️ SHORTS COVERING — fuel leaving quietly"
         mult  = 0.85
+    elif result.si_trend_source == "settlement":
+        # ── MEASURED, NO CHANGE — not "no data" ──
+        # SI and DTC now come from the exchange settlement series, which
+        # carries ~26 periods per symbol and needs no local warm-up. So a
+        # missing snapshot no longer means the matrix is blind: two of its
+        # three lenses read fine, they simply read FLAT.
+        #
+        # Reaching STALE/NO HISTORY here reported "last snapshot too old"
+        # on names whose trends had just been measured — 19% of graded
+        # episodes were labelled unmeasurable when they were merely
+        # unchanged. Same 1.00 multiplier either way, but the label is the
+        # difference between "we could not look" and "we looked and nothing
+        # moved", and every analysis that groups by state inherited the lie.
+        state = "➡️ STABLE — settlement trends flat"
+        if not prev:
+            state += " (CTB unread — no recent snapshot)"
+        mult  = 1.00
     elif not prev and has_any_history:
         state = "⚠️ STALE HISTORY — last snapshot too old for 1-wk trend, conviction neutral (rescan within a week to rebuild)"
         mult  = 1.00
@@ -1575,8 +1825,21 @@ def analyze_conviction_matrix(ticker: str,
     # conviction matrix over/under-delivers, scale its DEVIATION from
     # neutral (1.0 stays 1.0; a 1.8 with scale 0.8 becomes 1.64).
     _cs = _learned_squeeze().get("conviction_effect_scale", 1.0)
-    if _cs and abs(_cs - 1.0) > 0.005 and abs(mult - 1.0) > 0.001:
-        mult = round(1.0 + (mult - 1.0) * _cs, 4)
+    # Config authority and learned scale compose: the learner says whether
+    # the matrix delivers what it claims, the config says how much of the
+    # ranking it may own. Both act on the deviation from neutral, so 1.00
+    # stays 1.00 under any combination and the ordering never changes.
+    _auth = float(_scoring_cfg().get("conviction_authority", 1.0))
+    _combined_scale = (_cs or 1.0) * _auth
+    result.conviction_mult_raw = mult
+    if abs(_combined_scale - 1.0) > 0.005 and abs(mult - 1.0) > 0.001:
+        mult = round(1.0 + (mult - 1.0) * _combined_scale, 4)
+        if abs(_auth - 1.0) > 0.005:
+            result.flags.append(
+                f"conviction {result.conviction_mult_raw:.2f}x damped to "
+                f"{mult:.2f}x (authority {_auth:.2f}) — the matrix drives "
+                f"~half the ranking on evidence that does not reach "
+                f"significance")
     result.conviction_mult  = mult
 
     if mult >= 1.5:
@@ -1887,6 +2150,7 @@ def run_deep_analysis(ticker: str, stage1_score: float = 0.0,
     result.float_shares  = getattr(m, "float_shares", None)
     result.effective_float  = getattr(m, "effective_float", None)
     result.float_tightness  = getattr(m, "float_tightness", None)
+    result._inst_capped     = getattr(m, "inst_capped", False)
     result.avg_daily_volume = getattr(m, "avg_daily_volume", None)
     # DTC family + settlement-cadence trends. The private attributes are read
     # by analyze_conviction_matrix, which runs after this.
@@ -1904,6 +2168,18 @@ def run_deep_analysis(ticker: str, stage1_score: float = 0.0,
     result._settlement_dtc_trend = getattr(m, "dtc_trend_settlement", "") or ""
     result._dtc_move_is_liquidity = getattr(m, "dtc_move_is_liquidity", False)
     result._settlement_vol_change = getattr(m, "settlement_vol_change", None)
+    result.borrow_available   = getattr(m, "borrow_available", False)
+    result.shares_available   = getattr(m, "shares_available", None)
+    result.borrow_utilization = getattr(m, "borrow_utilization", None)
+    result.borrow_rate_real   = getattr(m, "borrow_rate_real", None)
+    result.borrow_state       = getattr(m, "borrow_state", "") or ""
+    result.borrow_near_zero   = getattr(m, "borrow_near_zero", False)
+    result.borrow_draining    = getattr(m, "borrow_draining", False)
+    result.reg_sho_on_list   = getattr(m, "reg_sho_on_list", False)
+    result.reg_sho_days      = getattr(m, "reg_sho_days", 0) or 0
+    result.reg_sho_mandatory = getattr(m, "reg_sho_mandatory", False)
+    result.reg_sho_days_to_mandatory = getattr(m, "reg_sho_days_to_mandatory", None)
+    result.cash_runway_months = getattr(m, "cash_runway_months", None)
     ctb_now      = m.ctb_proxy
     si_pct       = m.short_interest_pct
     dtc          = m.days_to_cover
@@ -1970,7 +2246,22 @@ def run_deep_analysis(ticker: str, stage1_score: float = 0.0,
             # note kept as text.
             result.catalyst_mult = 1.00
         else:
-            result.catalyst_mult = 1.0
+            # NONE (and anything unclassified). The reasoning above was right
+            # about the ORDERING and fixed it in the wrong direction: rather
+            # than raising TOO_FAR to meet ignorance, ignorance should sit
+            # below information. Measured, TOO_FAR returned +0.54% and NONE
+            # -4.64%, so the gap is real and this is the one audit finding
+            # that held its sign in both halves of the sample.
+            _nc = _scoring_cfg()
+            if (_nc.get("use_no_catalyst_penalty", True)
+                    and cat.catalyst_window in ("NONE", "", None)):
+                result.catalyst_mult = float(_nc.get("no_catalyst_mult", 0.85))
+                result.warnings.append(
+                    f"no known catalyst — x{result.catalyst_mult:.2f}. Names "
+                    f"with nothing scheduled returned -4.6% vs +0.9% for "
+                    f"those with a catalyst (p=0.003, held in both halves)")
+            else:
+                result.catalyst_mult = 1.0
 
         # ── LEARNED ADJUSTMENT (learning_engine) ──
         # If the graded outcome log shows a window performing above or
@@ -2024,9 +2315,88 @@ def run_deep_analysis(ticker: str, stage1_score: float = 0.0,
     # ── FINAL SCORE: combined × conviction × catalyst timing ──
     # Three multiplicative layers. Scores >100 expected and meaningful.
     # A perfect setup at the perfect time compounds; a stale one decays.
-    result.final_score = (stage1_score
-                          * result.conviction_mult
-                          * result.catalyst_mult)
+    # ── FTD CLOSE-OUT MULTIPLIER ──
+    # Computed after the catalyst layer, because it must know whether the
+    # close-out already won the catalyst merge (in which case it stands down).
+    result.ftd_mult = _ftd_closeout_multiplier(result)
+    if result.ftd_mult > 1.0:
+        result.flags.append(
+            f"FTD close-out multiplier x{result.ftd_mult:.2f} — "
+            f"{result.ftd_mult_basis}")
+
+    # ── REG SHO THRESHOLD LIST ──
+    # The official determination, and the only genuinely mechanical clock in
+    # the model: at 13 consecutive sessions the close-out is compulsory, not
+    # projected. Scored only when the name is actually on the list, so this
+    # cannot penalise the ordinary case.
+    _rs_cfg = _scoring_cfg()
+    if _rs_cfg.get("use_reg_sho", True) and result.reg_sho_on_list:
+        _ceil = float(_rs_cfg.get("reg_sho_mult_max", 1.20))
+        _prog = min(result.reg_sho_days / 13.0, 1.0)
+        result.reg_sho_mult = round(1.0 + (_ceil - 1.0) * _prog, 4)
+        if result.reg_sho_mandatory:
+            result.flags.append(
+                f"REG SHO: {result.reg_sho_days} consecutive sessions on the "
+                f"threshold list — close-out is MANDATORY, not projected "
+                f"(x{result.reg_sho_mult:.2f})")
+        else:
+            result.flags.append(
+                f"REG SHO: on the threshold list {result.reg_sho_days} "
+                f"sessions, {result.reg_sho_days_to_mandatory} more forces "
+                f"mandatory close-out (x{result.reg_sho_mult:.2f})")
+
+    # ── BORROW EXHAUSTION MULTIPLIER ──
+    # Ramps on utilization between the "tight" and "extreme" thresholds, with
+    # a lift when the pool is actively draining. Never below 1.0: plentiful
+    # borrow is the normal state of the world, not a mark against a name.
+    _bcfg = _scoring_cfg()
+    if (_bcfg.get("use_borrow_exhaustion", True) and result.borrow_available
+            and result.borrow_utilization is not None):
+        import borrow_availability as _ba
+        _u = result.borrow_utilization
+        _lo, _hi = _ba.UTIL_HIGH, _ba.UTIL_EXTREME
+        _prog = min(max((_u - _lo) / max(_hi - _lo, 1e-9), 0.0), 1.0)
+        if result.borrow_draining:
+            _prog = min(_prog + 0.15, 1.0)
+        _ceil = float(_bcfg.get("borrow_mult_max", 1.25))
+        result.borrow_mult = round(1.0 + (_ceil - 1.0) * _prog, 4)
+        if result.borrow_mult > 1.0:
+            # The consequence clause only applies once the pool is actually
+            # exhausted. At 85% utilization there are still shares to borrow,
+            # and claiming otherwise would be the kind of overstatement this
+            # scanner is supposed to avoid.
+            _tail = (" — nothing left to borrow, so shorts can neither press "
+                     "nor roll" if result.borrow_near_zero
+                     else " — the lendable pool is thinning")
+            result.flags.append(
+                f"{result.borrow_state}: utilization {_u:.1%}"
+                + (", pool draining" if result.borrow_draining else "")
+                + f" (x{result.borrow_mult:.2f}){_tail}")
+
+    # ── CASH RUNWAY / DILUTION RISK ──
+    # A company that runs out of cash issues shares into any spike. Reported
+    # as a warning, not scored: the mechanism is well established but nothing
+    # in this repo has validated a threshold against outcomes.
+    _rw = result.cash_runway_months
+    if _rw is not None and _rw != float('inf'):
+        if _rw < 6:
+            result.warnings.append(
+                f"cash runway {_rw:.1f} months — a raise is likely inside the "
+                f"trade horizon; dilution into a spike is the standard way a "
+                f"squeeze becomes a permanent loss (not scored)")
+        elif _rw < 12:
+            result.warnings.append(
+                f"cash runway {_rw:.1f} months — dilution risk (not scored)")
+
+    # final_v1 keeps the two-multiplier formula so the log can answer whether
+    # the third one earned its place, on identical rows.
+    result.final_score_v1 = (stage1_score
+                             * result.conviction_mult
+                             * result.catalyst_mult)
+    result.final_score = (result.final_score_v1
+                          * result.ftd_mult
+                          * result.reg_sho_mult
+                          * result.borrow_mult)
 
     return result
 
@@ -2204,6 +2574,19 @@ def format_deep_display(r: DeepSqueezeResult) -> str:
     lines.append(f"     State:      {r.conviction_state}")
     lines.append(f"     Multiplier: {r.conviction_mult:.2f}x")
 
+    if r.borrow_available:
+        lines.append(f"")
+        lines.append(f"  🔒 BORROW AVAILABILITY")
+        if r.shares_available is not None:
+            lines.append(f"     Shares available:   {r.shares_available:,.0f}")
+        if r.borrow_utilization is not None:
+            lines.append(f"     Utilization:        {r.borrow_utilization:.1%}")
+        if r.borrow_rate_real is not None:
+            lines.append(f"     Borrow rate (REAL): {r.borrow_rate_real:.1f}%")
+        lines.append(f"     State:              {r.borrow_state}")
+        if r.borrow_mult != 1.0:
+            lines.append(f"     Multiplier:         {r.borrow_mult:.2f}x")
+
     if r.dtc_exchange or r.dtc_robust:
         lines.append(f"")
         lines.append(f"  📏 DAYS TO COVER by volume window")
@@ -2238,12 +2621,18 @@ def format_deep_display(r: DeepSqueezeResult) -> str:
             lines.append(f"     Earnings:   {r.days_to_earnings:+d} days out")
         lines.append(f"     Cat. score: {r.catalyst_score:.0f}/100")
         lines.append(f"     Cat. mult:  {r.catalyst_mult:.2f}x")
+    if r.ftd_mult != 1.0 or r.ftd_mult_basis:
+        lines.append(f"     FTD mult:   {r.ftd_mult:.2f}x  ({r.ftd_mult_basis})")
     else:
         lines.append(f"     (catalyst layer unavailable)")
     lines.append(f"")
+    _ftdm = (f" × {r.ftd_mult:.2f} ftd" if r.ftd_mult != 1.0 else "")
     lines.append(f"     FINAL SCORE: {r.final_score:.0f}  "
                  f"(combined × {r.conviction_mult:.2f} conv × "
-                 f"{r.catalyst_mult:.2f} cat)")
+                 f"{r.catalyst_mult:.2f} cat{_ftdm})")
+    if r.ftd_mult != 1.0:
+        lines.append(f"                  without FTD multiplier: "
+                     f"{r.final_score_v1:.0f}")
 
     if r.flags:
         lines.append(f"")

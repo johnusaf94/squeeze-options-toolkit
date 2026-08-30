@@ -36,16 +36,55 @@ def _trading_days_after(start: datetime, n: int) -> datetime:
     return start + timedelta(days=int(n * 1.4) + 2)
 
 
+# How far past the target date a bar may sit and still be accepted as that
+# date's price. A holiday or a thin tape can push the next print out a few
+# sessions; a week means the security stopped trading, and the last tick
+# before it stopped is not an outcome.
+MAX_PRICE_GAP_DAYS = 7
+
+# Below this scan-date price, an outcome is arithmetic rather than a result.
+# CRKN was scanned at $0.0003 and printed $0.0179 five sessions later — a
+# genuine, correctly measured +5850%, and completely undominated by anything
+# else in 2,900 rows. One such row rewrites any regression that reads the
+# column. The names this excludes are the same ones liveness.py now keeps out
+# of the universe, so this only matters for history already on disk.
+MIN_GRADABLE_PRICE = 0.10
+
+
 def _price_on_or_after(ticker: str, target: datetime, hist) -> float:
-    """Closest closing price on/after target date from a history frame."""
+    """Closest closing price on/after target date, or None if the tape ended.
+
+    The old version fell back to `hist["Close"].iloc[-1]` whenever the target
+    ran past the end of history — silently grading a delisted or halted name
+    against its final tick no matter how stale. CRKN, SBNY and MDRX were
+    graded that way for months and produced returns to -99.9%, which then
+    dominated every statistic computed from this log: removing those three
+    tickers moves the base rate from -0.84% to +1.08% and accounts for 14 of
+    the 20 worst episodes.
+
+    A missing outcome is honest. A fabricated one is not.
+    """
     try:
+        if hist is None or hist.empty:
+            return None
         for idx, row in hist.iterrows():
             d = idx.to_pydatetime().replace(tzinfo=None)
             if d >= target:
-                return float(row["Close"])
-        # target beyond available data — use last close
-        if not hist.empty:
-            return float(hist["Close"].iloc[-1])
+                if (d - target).days > MAX_PRICE_GAP_DAYS:
+                    return None      # gap in the tape — refuse to guess
+                c = float(row["Close"])
+                # A bar can exist with no print. NaN propagates silently
+                # through the return arithmetic and lands in the log as the
+                # literal string "nan", which then poisons every statistic
+                # and crashes the report. Treat it as no price.
+                return c if c == c and c > 0 else None
+        # Target is past the end of the tape. Only accept if the tape ended
+        # within the tolerance; otherwise the security stopped trading and
+        # there is no price for this date.
+        last_d = hist.index[-1].to_pydatetime().replace(tzinfo=None)
+        if (target - last_d).days <= MAX_PRICE_GAP_DAYS:
+            c = float(hist["Close"].iloc[-1])
+            return c if c == c and c > 0 else None
     except Exception:
         pass
     return None
@@ -129,13 +168,46 @@ def fill_outcomes():
                 continue
 
             for r, scan_dt, age in entries:
-                try:
-                    p0 = float(r["price_at_scan"])
-                except (ValueError, TypeError):
-                    p0 = None
+                # ── NUMERATOR AND DENOMINATOR MUST SHARE AN ADJUSTMENT ──
+                # `price_at_scan` is the raw quote logged at scan time.
+                # `hist` is split- and dividend-ADJUSTED and is rewritten
+                # retroactively by every corporate action. Dividing one by
+                # the other means any split inside the window produces a
+                # return that is pure arithmetic artifact.
+                #
+                # The scan-date price is therefore taken from the SAME
+                # adjusted frame the exit price comes from. price_at_scan
+                # survives only as a last resort, flagged, for rows whose
+                # history could not be fetched at all.
+                p0 = _price_on_or_after(ticker, scan_dt, hist)
                 if not p0 or p0 <= 0:
-                    p0 = _price_on_or_after(ticker, scan_dt, hist)
-                if not p0:
+                    # NO unadjusted fallback. Reaching for price_at_scan here
+                    # would put a raw quote over an adjusted exit price — the
+                    # exact unit mismatch this block exists to prevent — and
+                    # it would do so precisely on the names where history is
+                    # patchy, which are the names most likely to have had a
+                    # corporate action. If the tape cannot price the scan
+                    # date, the row does not get an outcome.
+                    continue
+                # A frozen quote is not a price. When the logged scan price
+                # and the adjusted history disagree by more than 5x, one of
+                # them describes a security that stopped trading; grading
+                # either way invents an outcome.
+                try:
+                    _raw = float(r["price_at_scan"])
+                except (ValueError, TypeError):
+                    _raw = None
+                if (_raw and _raw > 0
+                        and (p0 / _raw > 5.0 or _raw / p0 > 5.0)):
+                    print(f"  {ticker}: scan price {_raw:g} vs adjusted "
+                          f"{p0:g} ({scan_dt.date()}) — corporate action or "
+                          f"dead tape, not graded")
+                    continue
+                if p0 < MIN_GRADABLE_PRICE:
+                    print(f"  {ticker}: scan price {p0:g} below "
+                          f"${MIN_GRADABLE_PRICE:g} ({scan_dt.date()}) — "
+                          f"sub-penny moves are arithmetic, not outcomes; "
+                          f"not graded")
                     continue
 
                 any_filled = False
@@ -308,13 +380,17 @@ def _print_report(rows):
             n, hr, avg = rep[key]
             print(f"  {grp+' '+lbl:<22} {n:>4} {hr:>9.0%} {avg:>+8.1%}")
 
+        # NaN-tolerant: a single unprintable bar used to take the whole
+        # report down with "cannot convert float NaN to integer", after the
+        # log had already been written — so the run looked like a failure
+        # when the data was fine.
         corrs = {k.split("::")[1]: v for k, v in rep.items()
-                 if k.startswith("corr::")}
+                 if k.startswith("corr::") and v == v}
         if corrs:
             print(f"\n  Signal correlation with {wl} return:")
             for sig, c in sorted(corrs.items(),
                                   key=lambda kv: abs(kv[1]), reverse=True):
-                bar = "█" * int(abs(c) * 20)
+                bar = "█" * int(min(abs(c), 1.0) * 20)
                 print(f"    {sig:<16} {c:>+.3f}  {bar}")
 
     print("\n" + "=" * 64)

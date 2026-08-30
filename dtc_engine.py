@@ -82,6 +82,17 @@ SPIKE_RATIO_FLAG = 1.25
 # rather than noise.
 COVER_THRESHOLD = 0.05      # +/-5% of the prior settlement's short interest
 
+# Days-to-cover ceiling, matching normalise_short_interest's cap on the `dtc`
+# column: "beyond that it's a data error or zombie stock". Uncapped, this
+# family reached 371 days on names whose median session volume was near zero
+# — arithmetically correct, meaningless as a measurement, and enough to
+# dominate any linear fit that reads the column. Capping here keeps the whole
+# DTC family on one convention instead of two.
+DTC_CAP = 60.0
+# Same reasoning for the mean/median volume ratio, which reached 566 on a
+# tape with essentially no median session.
+SPIKE_RATIO_CAP = 20.0
+
 
 def _clean(vals) -> list:
     out = []
@@ -142,7 +153,9 @@ def volume_windows(volumes, asof=None) -> dict:
         out[f'n{w}'] = len(chunk)
 
     m10, md10 = out.get('mean10'), out.get('median10')
-    out['spike_ratio'] = (m10 / md10) if (m10 and md10) else None
+    _sr = (m10 / md10) if (m10 and md10) else None
+    out['spike_ratio'] = min(_sr, SPIKE_RATIO_CAP) if _sr else None
+    out['spike_ratio_capped'] = bool(_sr and _sr > SPIKE_RATIO_CAP)
     out['spike_contaminated'] = bool(out['spike_ratio']
                                      and out['spike_ratio'] >= SPIKE_RATIO_FLAG)
     return out
@@ -185,7 +198,9 @@ def dtc_panel(short_interest: Optional[float], volumes,
     out['spike_contaminated'] = vw.get('spike_contaminated', False)
 
     def _d(v):
-        return (short_interest / v) if v else None
+        if not v:
+            return None
+        return min(short_interest / v, DTC_CAP)
 
     out['replica_10d_mean']    = _d(vw.get('mean10'))
     out['robust_10d_median']   = _d(vw.get('median10'))

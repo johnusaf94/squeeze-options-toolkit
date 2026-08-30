@@ -93,6 +93,9 @@ class SqueezeMetrics:
     # through share lending — the lender and the short's counterparty both
     # report the same share.
     institutional_shares_over_float: Optional[float] = None
+    # True when 13F holdings exceeded the float and effective float fell back
+    # to a fixed fraction — carries no name-specific information once set.
+    inst_capped:             bool = False
 
     current_price:           Optional[float] = None
     price_change_1m:         Optional[float] = None
@@ -111,6 +114,43 @@ class SqueezeMetrics:
     short_change_pct:        Optional[float] = None
 
     fetch_errors:            list = field(default_factory=list)
+
+    # Liveness. `alive` False means the tape has no liquidity to enter or
+    # exit and every metric below is arithmetic on a corpse — the scanner
+    # should drop the name, not rank it. `zombie` means it trades but
+    # days-to-cover has pinned the 60 cap (0 winners in 21 graded episodes).
+    alive:                   bool = True
+    zombie:                  bool = False
+    liveness_reasons:        list = field(default_factory=list)
+    # STOCK / REIT / ETF / MUTUAL_FUND / UNKNOWN. data_validator has always
+    # classified this and the squeeze path has never read it, so SPY and TQQQ
+    # ran the full analysis — float, insider ownership and earnings timing all
+    # absent — and scored 58, mid-pack among real candidates.
+    asset_type:              str = "UNKNOWN"
+    price_source:            str = ""
+    price_stale_ratio:       Optional[float] = None
+
+    # Borrow availability — the squeeze precondition. borrow_available
+    # False means no source is configured, NOT that shares are unavailable.
+    borrow_available:        bool = False
+    shares_available:        Optional[float] = None
+    borrow_utilization:      Optional[float] = None
+    borrow_avail_pct_float:  Optional[float] = None
+    borrow_rate_real:        Optional[float] = None
+    borrow_state:            str = ""
+    borrow_near_zero:        bool = False
+    borrow_draining:         bool = False
+
+    # Reg SHO threshold list — the official determination, not our estimate
+    reg_sho_on_list:         bool = False
+    reg_sho_days:            int = 0
+    reg_sho_mandatory:       bool = False
+    reg_sho_days_to_mandatory: Optional[int] = None
+    reg_sho_available:       bool = False
+
+    # Months of cash before a raise is forced. inf = cash-generative.
+    cash_runway_months:      Optional[float] = None
+    cash_burn_annual:        Optional[float] = None
 
 
 @dataclass
@@ -147,21 +187,51 @@ class ChamathAnalysis:
 # SHARED DATA FETCHER — uses data_validator
 # ─────────────────────────────────────────────
 
-def fetch_squeeze_metrics(ticker: str) -> SqueezeMetrics:
+def fetch_squeeze_metrics(ticker: str, enrich: bool = True) -> SqueezeMetrics:
     """
     Fetch all squeeze-relevant data using data_validator for accuracy.
     All fields are validated and normalised before use.
+
+    enrich=False runs the cheap pass: yfinance info and history only, no SEC
+    fails, no FINRA settlements, no Reg SHO list, no effective float. Costs
+    about an eighth as much and carries everything the SI/DTC pre-filter
+    needs. See fetch_validated_info for the measurements.
     """
     from data_validator import fetch_validated_info
 
     m = SqueezeMetrics(ticker=ticker.upper())
 
     try:
-        v = fetch_validated_info(ticker)
+        v = fetch_validated_info(ticker, enrich=enrich)
 
         if v.get('_fetch_error'):
             m.fetch_errors.append(v['_fetch_error'])
             return m
+
+        m.asset_type        = getattr(v, 'asset_type', 'UNKNOWN') or 'UNKNOWN'
+        m.alive             = bool(getattr(v, 'alive', True))
+        m.zombie            = bool(getattr(v, 'zombie', False))
+        m.liveness_reasons  = list(getattr(v, 'liveness_reasons', []) or [])
+        m.price_source      = v.get('priceSource', '') or ''
+        m.price_stale_ratio = v.get('priceStaleRatio')
+        m.borrow_available       = bool(v.get('borrowAvailable'))
+        m.shares_available       = v.get('sharesAvailable')
+        m.borrow_utilization     = v.get('borrowUtilization')
+        m.borrow_avail_pct_float = v.get('borrowAvailPctFloat')
+        m.borrow_rate_real       = v.get('borrowRateReal')
+        m.borrow_state           = v.get('borrowState', '') or ''
+        m.borrow_near_zero       = bool(v.get('borrowNearZero'))
+        m.borrow_draining        = bool(v.get('borrowDraining'))
+        m.reg_sho_on_list   = bool(v.get('regShoOnList'))
+        m.reg_sho_days      = v.get('regShoDays', 0) or 0
+        m.reg_sho_mandatory = bool(v.get('regShoMandatory'))
+        m.reg_sho_days_to_mandatory = v.get('regShoDaysToMandatory')
+        m.reg_sho_available = bool(v.get('regShoAvailable'))
+        m.cash_runway_months = v.get('cashRunwayMonths')
+        m.cash_burn_annual   = v.get('cashBurnAnnual')
+        if not m.alive:
+            m.fetch_errors.append(
+                "not tradeable: " + "; ".join(m.liveness_reasons))
 
         m.company_name           = v.get('longName', ticker)
         m.sector                 = v.get('sector', 'Unknown') or 'Unknown'
@@ -215,6 +285,7 @@ def fetch_squeeze_metrics(ticker: str) -> SqueezeMetrics:
         m.float_tightness         = v.get('floatTightness')
         m.ftd_pct_eff_float       = v.get('ftdPctEffFloat')
         m.institutional_shares_over_float = v.get('instSharesOverFloat')
+        m.inst_capped            = bool(v.get('instCapped'))
 
         # CTB proxy (enhanced with FTD)
         m.ctb_proxy              = v.get('ctbProxy')

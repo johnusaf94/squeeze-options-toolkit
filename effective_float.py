@@ -110,6 +110,13 @@ def compute_effective_float(float_shares: Optional[float],
         'locked_frac':          locked_frac,
         'tightness':            None,     # reported float / effective float
         'floored':              False,
+        # True when 13F holdings exceeded the float and the cap bound. That
+        # matters downstream: once capped, effective float is exactly
+        # float x (1 - locked_frac) — a CONSTANT multiple of the reported
+        # float, carrying no name-specific information. Anything that scores
+        # off effective float must check this flag, or it will read the same
+        # constant on every heavily-lent name and mistake it for a signal.
+        'inst_capped':          False,
         'quality':              'unavailable',
         'notes':                [],
     }
@@ -180,6 +187,7 @@ def compute_effective_float(float_shares: Optional[float],
 
     # -- Trap 3: 13F totals can exceed the float --
     inst_in_float = min(inst_shares, base)
+    out['inst_capped'] = bool(inst_shares > base)
     if inst_shares > base and base > 0:
         out['notes'].append(
             f"13F institutional holdings ({inst_shares:,.0f} sh) EXCEED the "

@@ -37,5 +37,7 @@ catalyst_cache*.json
 grading_status.json
 grading_runs.log
 scoring_config.json
+borrow_snapshots.json
+borrow_data/
 squeeze_*_*.csv
 scratch_*.txt

@@ -547,12 +547,48 @@ class SqueezeSearcherApp:
                 except Exception:
                     pass
 
-                # Quick pre-filter: fetch raw metrics first
+                # ── PHASE 1: CHEAP PASS ──
+                # Fetch only what the threshold below actually reads. The
+                # expensive layers — SEC fails, FINRA settlements, Reg SHO,
+                # effective float — are 87% of the per-ticker cost and were
+                # paid for every name before most were discarded here.
+                # Survivors are re-fetched enriched below, by which point
+                # info and history are already in the throttle cache.
                 try:
-                    metrics = fetch_squeeze_metrics(ticker)
+                    metrics = fetch_squeeze_metrics(ticker, enrich=False)
                 except Exception as e:
                     self._sq_write(f"  ⚠️  {ticker}: fetch error — {e}\n", "dim")
                     continue
+
+                # ── LIVENESS GATE (runs before every threshold) ──
+                # A name with no liquidity to enter or exit is not a
+                # candidate at any score. Three such tickers were 3.6% of
+                # graded episodes and moved the log's base rate from
+                # -0.84% to +1.08% on their own, so this gate comes first.
+                # A fund has no float to squeeze, no insiders, no earnings and
+                # no borrow scarcity in the sense this scanner means. SPY and
+                # TQQQ ran the whole pipeline and scored 58.
+                if getattr(metrics, "asset_type", "") in ("ETF", "MUTUAL_FUND"):
+                    self._sq_write(
+                        f"  ✗ {ticker:<6}  {metrics.asset_type} — no float to "
+                        f"squeeze\n", "pass_tag")
+                    continue
+                if not getattr(metrics, "alive", True):
+                    self._sq_write(
+                        f"  ✗ {ticker:<6}  DEAD — "
+                        f"{'; '.join(getattr(metrics, 'liveness_reasons', []))}\n",
+                        "pass_tag")
+                    continue
+                if getattr(metrics, "zombie", False):
+                    self._sq_write(
+                        f"  ✗ {ticker:<6}  ZOMBIE — DTC at the 60 cap "
+                        f"(0 winners in 21 graded episodes)\n", "pass_tag")
+                    continue
+                if getattr(metrics, "price_source", "") == "history_info_stale":
+                    self._sq_write(
+                        f"  ⚠️  {ticker:<6}  stale quote corrected from the "
+                        f"tape ({getattr(metrics,'price_stale_ratio',0):.1f}x "
+                        f"apart) — using {metrics.current_price:g}\n", "dim")
 
                 # Pre-filter on minimum thresholds to skip obvious non-candidates fast
                 si = metrics.short_interest_pct or 0
@@ -563,6 +599,15 @@ class SqueezeSearcherApp:
                         "pass_tag"
                     )
                     continue
+
+                # ── PHASE 2: ENRICH THE SURVIVORS ──
+                # This name cleared every gate, so it is worth the full fetch.
+                # info and history are cached by now, so this pays only for
+                # the network layers phase 1 skipped.
+                try:
+                    metrics = fetch_squeeze_metrics(ticker, enrich=True)
+                except Exception as e:
+                    self._sq_write(f"  ⚠️  {ticker}: enrich failed — {e}\n", "dim")
 
                 # Run full squeeze analyses
                 gill_result    = None
@@ -711,6 +756,34 @@ class SqueezeSearcherApp:
                             c['magnitude_v1']      = getattr(deep, 'magnitude_score_v1', None)
                             c['ftd_score_v1']      = getattr(deep, 'ftd_score_v1', None)
                             c['ftd_impact_factor_v1'] = getattr(deep, 'ftd_impact_factor_v1', None)
+                            c['borrow_utilization'] = getattr(deep, 'borrow_utilization', None)
+                            c['shares_available']  = getattr(deep, 'shares_available', None)
+                            c['borrow_rate_real']  = getattr(deep, 'borrow_rate_real', None)
+                            c['borrow_mult']       = getattr(deep, 'borrow_mult', 1.0)
+                            c['borrow_state']      = getattr(deep, 'borrow_state', '')
+                            c['conviction_mult_raw'] = getattr(deep, 'conviction_mult_raw', None)
+                            c['convexity_score']   = getattr(deep, 'convexity_score', None)
+                            c['ctb_velocity_score'] = getattr(deep, 'ctb_velocity_score', None)
+                            c['ftd_score']         = getattr(deep, 'ftd_score', None)
+                            c['svr_score']         = (getattr(deep, 'svr_score', None)
+                                                      if getattr(deep, 'svr_available', False) else None)
+                            c['momentum_score']    = (getattr(deep, 'momentum_score', None)
+                                                      if getattr(deep, 'momentum_available', False) else None)
+                            c['ret_5d']            = getattr(deep, 'ret_5d', None)
+                            c['ret_20d']           = getattr(deep, 'ret_20d', None)
+                            c['rel_volume']        = getattr(deep, 'rel_volume', None)
+                            c['float_shares']      = getattr(deep, 'float_shares', None)
+                            c['ctb_trend']         = getattr(deep, 'ctb_trend', '')
+                            c['dtc_trend']         = getattr(deep, 'dtc_trend', '')
+                            c['si_trend']          = getattr(deep, 'si_trend', '')
+                            c['calibrated_prob']   = getattr(deep, 'calibrated_prob', None)
+                            c['ftd_mult']          = getattr(deep, 'ftd_mult', 1.0)
+                            c['reg_sho_days']      = getattr(deep, 'reg_sho_days', 0)
+                            c['reg_sho_mult']      = getattr(deep, 'reg_sho_mult', 1.0)
+                            c['exhaustion_factor'] = getattr(deep, 'exhaustion_factor', 1.0)
+                            c['momentum_raw']      = getattr(deep, 'momentum_score_raw', None)
+                            c['cash_runway_months'] = getattr(deep, 'cash_runway_months', None)
+                            c['final_score_v1']    = getattr(deep, 'final_score_v1', None)
                             c['dtc_exchange']      = getattr(deep, 'dtc_exchange', None)
                             c['dtc_robust']        = getattr(deep, 'dtc_robust', None)
                             c['dtc_60d']           = getattr(deep, 'dtc_60d', None)
@@ -778,7 +851,19 @@ class SqueezeSearcherApp:
                                 and c.get("ftd_closeout_date") in _shared):
                             _old_m = c.get("catalyst_mult", 1.0) or 1.0
                             c["catalyst_mult"] = round(_old_m * 0.85, 3)
+                            # Must mirror run_deep_analysis's formula exactly,
+                            # ftd_mult included. It is 1.0 on this branch
+                            # today (the close-out IS the catalyst here, so
+                            # the multiplier stands down to avoid
+                            # double-counting), but omitting it would make
+                            # this line silently wrong the moment that rule
+                            # changes.
+                            _fm = c.get("ftd_mult", 1.0) or 1.0
                             c["final_score"] = round(
+                                (c.get("combined", 0) or 0)
+                                * (c.get("conviction_mult", 1.0) or 1.0)
+                                * c["catalyst_mult"] * _fm, 2)
+                            c["final_score_v1"] = round(
                                 (c.get("combined", 0) or 0)
                                 * (c.get("conviction_mult", 1.0) or 1.0)
                                 * c["catalyst_mult"], 2)
