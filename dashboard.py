@@ -74,6 +74,14 @@ APPS = [
         "color": "#A78BFA",
     },
     {
+        "key": "value", "tab": "💵  Value Analysis",
+        "file": "value_analysis_gui.py", "title": "Value Analysis",
+        "desc": "Price against the earnings behind it",
+        "detail": "SEC XBRL earnings history · normal vs 15x benchmark\n"
+                  "multiple · consensus forecast · total-return scenarios",
+        "color": "#F5A97F",
+    },
+    {
         "key": "journal", "tab": "📓  Options Journal",
         "file": "options_journal_gui.py", "title": "Options Journal",
         "desc": "Open positions & realized results",
@@ -291,8 +299,8 @@ class Dashboard:
                      f"{', '.join(missing)}", fg=ACCENT)
         else:
             self._status.config(
-                text="✓ All four tools launched "
-                     "(four independent processes)", fg=GREEN)
+                text=f"✓ All {len(APPS)} tools launched "
+                     f"({len(APPS)} independent processes)", fg=GREEN)
 
     def _poll_processes(self):
         alive = [self._app_by_key(k)["title"]
