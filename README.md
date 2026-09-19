@@ -65,9 +65,12 @@ comparison between old rows and new rows, where the market also moved.
 
 ## Value analysis
 
-`value_analysis_gui.py` plots price over three coloured bands, each bounded by
-a multiple of the company's own earnings — green under both references, amber
-between them, red over both. The references are the *normal* multiple (what
+`value_analysis_gui.py` plots price over coloured bands whose edges are all
+multiples of the company's own earnings — amber between two reference
+multiples, green below them and red above, each step deepening in colour the
+further it sits from that corridor. Thin lines at round multiples (2×, 4×, 8×
+…) are marked on the right edge as a ruler, because no price axis, log or
+linear, can say "this is 6× sales". The references are the *normal* multiple (what
 this stock actually traded at over the window, median monthly) and the
 *benchmark* (15x, or the growth rate capped at 30x for faster compounders).
 They are ordered by value rather than by name, because a company the market has
@@ -92,6 +95,50 @@ because each of them silently corrupts this chart if it is not:
 - **GAAP versus adjusted.** Actuals are GAAP; consensus is adjusted. The
   forecast is drawn from consensus *growth rates* applied to the last GAAP
   actual, and the level gap between the two bases is reported.
+
+A value meter scores where today's price sits, 0 (expensive) to 100 (cheap),
+from four visible parts: the current multiple's rank in its own history, its
+distance from the normal multiple, its distance from the benchmark, and the
+return consensus growth alone would deliver at today's multiple. The weights
+are judgement, printed beside each part, and nothing in the meter has been
+tested against what prices did next. A confidence reading — docked for erratic
+earnings, loss years, a short filing history, a re-rating, a dividend cut, or
+an impossible break in the series — pulls the score toward 50, so a chart that
+cannot be trusted cannot produce a loud number.
+
+Consensus is matched to the metric: revenue per share grows at the revenue
+consensus, EPS at the earnings consensus. Cash flow and dividends have no
+published consensus, so their forecast extends the metric's own historical
+rate, is labelled an extrapolation rather than a forecast, and is left out of
+the meter.
+
+**Dividends are shown as yield**, because 22× the dividend and a 4.6% yield
+are the same number and only one of them is how anyone quotes it. The grid,
+the reference lines and the lower panel all speak in percent, and the outside
+reference is the **10-year Treasury** rather than 15× earnings — above that
+line the dividend beats government debt, below it you are paid less than cash
+for holding equity. Today's yield is priced against the last twelve months of
+actual payments, so a cut shows up immediately instead of waiting a year for
+the next annual report.
+
+**Scenarios** put bear, base and bull at the end of the forecast. Both axes
+are measured rather than assumed: the exit multiple is the stock's own 25th,
+50th and 75th percentile, and the earnings are the low, average and high of
+published consensus applied as a ratio to the base path. The odds are the
+percentile definition, not a forecast. The scenarios are clamped to bracket
+today's multiple — an unclamped "bear" case had PayPal doubling, because even
+the 25th percentile of its history is twice where it trades now — and each row
+reports the re-rating it assumes, alongside the return growth alone would give.
+
+**Dividend cover** is a toggle: earnings cover and free cash flow cover, drawn
+on the lower panel against a line at 1.0×. Cash cover is the one that decides,
+because a dividend is paid out of cash and not out of accounting profit — in
+2025 Coca-Cola earned 1.49× its dividend and generated 0.60× of it.
+
+The chart takes drag to pan, scroll to zoom and double-click to reset, and the
+`Fit` control decides whether the vertical scale has to contain the forecast.
+It does not by default on a linear axis, where a fast grower's fan flattens a
+decade of price into an unreadable strip.
 
 The math has no GUI imports and can be checked from a terminal:
 
