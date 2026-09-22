@@ -90,6 +90,14 @@ APPS = [
         "color": "#8957e5",
     },
     {
+        "key": "copytrade", "tab": "🏛  Copy Trading",
+        "file": "political_gui.py", "title": "Copy Trading",
+        "desc": "Disclosure feed for notable figures",
+        "detail": "House + Senate PTRs · SEC Form 4 · 13F funds\n"
+                  "live scanner · forward grading · permutation-tested ranks",
+        "color": "#F38BA8",
+    },
+    {
         "key": "portfolio", "tab": "🏗  Portfolio Builder",
         "file": "portfolio_builder_gui.py", "title": "Portfolio Builder",
         "desc": "Discovery & allocation",

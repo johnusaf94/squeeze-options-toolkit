@@ -20,6 +20,26 @@
 !*.py
 !.gitignore
 !README.md
+!COPY_TRADING_PLAN.md
+
+# ── The one DATA file that is re-included, deliberately ──
+# political_snapshot.json.gz is the copy trading tool's published output and
+# committing it is the entire sharing mechanism: one machine scans, everyone
+# else reads the file instead of hammering the House Clerk.
+#
+# It is re-included because of what it contains, not because it is
+# convenient. Every row in it is already a public record — congressional
+# periodic transaction reports, SEC Form 4 and 13F filings — and none of it
+# touches this repository's own holdings, capital or risk limits. The
+# statutory restriction on congressional disclosure reports (Ethics in
+# Government Act Title 1) is about COMMERCIAL use and solicitation, not
+# about republication, and this tool is neither.
+#
+# `raw` is stripped before publish, so the file carries no filing text, and
+# the working database that does is excluded below. If the snapshot ever
+# starts carrying anything that is not a public record, this line comes out
+# first.
+!political_snapshot.json.gz
 
 # ── Never, under any circumstance ──
 # Redundant against the `*` above; kept explicit so the intent survives any
@@ -41,3 +61,6 @@ borrow_snapshots.json
 borrow_data/
 squeeze_*_*.csv
 scratch_*.txt
+political.db
+political_log.csv
+political_cache/
