@@ -22,6 +22,27 @@ from shared_utils import *
 
 PORTFOLIO_FILE = "portfolio.xlsx"
 
+# The cheap pre-filter pass computes days to cover as a settlement snapshot
+# over a ROLLING 10-day volume average, because it skips the settlement fetch.
+# That is a different quantity from the exchange's contemporaneous ratio and it
+# errs in BOTH directions — measured 2026-08-30 against the 2026-08-14
+# settlement:
+#
+#     ticker   cheap pass   exchange
+#     GME          10.09       5.31      cheap ADMITS a name it should reject
+#     CLOV          7.57       4.98
+#     LCID          4.65       6.21      cheap REJECTS a name it should admit
+#     BYND          3.04       2.25
+#     RIOT          2.78       1.93
+#
+# The false reject is the expensive one: the name is dropped before the
+# enriched fetch that would have corrected it ever runs, so the error is
+# silent and permanent for that scan. Widening the pre-filter by this factor
+# lets those names through to enrichment, where the real min_dtc is applied
+# against the exchange figure. 0.6 covers the worst observed understatement
+# (LCID, cheap = 0.75x exchange) with margin.
+DTC_PREFILTER_SLACK = 0.6
+
 
 class SqueezeSearcherApp:
     def __init__(self, root):
@@ -514,7 +535,13 @@ class SqueezeSearcherApp:
                     f"{len(universe):,} tickers\n"
                     f"  Min SI: {min_si:.0%} | DTC ≥ {min_dtc:.1f}d | "
                     f"Score ≥ {min_score:.0f}\n"
-                    f"  Chronic high-SI names scanned first.\n\n", "dim"
+                    f"  Chronic high-SI names scanned first.\n"
+                    f"  DTC with a trailing ~ is the cheap pre-filter estimate "
+                    f"(settlement short interest over a rolling 10-day volume "
+                    f"average),\n  not the exchange's contemporaneous ratio. "
+                    f"Pre-filter runs at {DTC_PREFILTER_SLACK:.0%} of the DTC "
+                    f"threshold; the full threshold applies after enrichment.\n\n",
+                    "dim"
                 )
             except ImportError:
                 self._sq_write(
@@ -590,12 +617,22 @@ class SqueezeSearcherApp:
                         f"tape ({getattr(metrics,'price_stale_ratio',0):.1f}x "
                         f"apart) — using {metrics.current_price:g}\n", "dim")
 
-                # Pre-filter on minimum thresholds to skip obvious non-candidates fast
+                # Pre-filter on minimum thresholds to skip obvious non-candidates
+                # fast. `dtc` here is the cheap pass's mixed-vintage estimate, so
+                # the DTC half of the gate runs slack (see DTC_PREFILTER_SLACK) and
+                # the real threshold is applied after enrichment. The SI half needs
+                # no slack: the cheap and official short-interest percentages come
+                # from the same settlement.
                 si = metrics.short_interest_pct or 0
                 dtc = metrics.days_to_cover or 0
-                if si < min_si or dtc < min_dtc:
+                dtc_src = getattr(metrics, "days_to_cover_source", "")
+                dtc_est = dtc_src != "nasdaq_official"
+                dtc_gate = (min_dtc * DTC_PREFILTER_SLACK) if dtc_est else min_dtc
+                if si < min_si or dtc < dtc_gate:
                     self._sq_write(
-                        f"  ○ {ticker:<6}  SI:{si:.0%}  DTC:{dtc:.1f}d  — below threshold\n",
+                        f"  ○ {ticker:<6}  SI:{si:.0%}  "
+                        f"DTC:{dtc:.1f}d{'~' if dtc_est else ''}"
+                        f"  — below threshold\n",
                         "pass_tag"
                     )
                     continue
@@ -608,6 +645,31 @@ class SqueezeSearcherApp:
                     metrics = fetch_squeeze_metrics(ticker, enrich=True)
                 except Exception as e:
                     self._sq_write(f"  ⚠️  {ticker}: enrich failed — {e}\n", "dim")
+
+                # `metrics` was just replaced, but si/dtc above still hold the
+                # cheap pass's values — and those locals are what the candidate
+                # dict carries into squeeze_log.csv and every line printed below.
+                # Without this refresh the log's `dtc` column is the mixed-vintage
+                # estimate even for names that were fully enriched, which is how
+                # 95.6% of the graded log came to be measured against a denominator
+                # nothing else in the system uses.
+                si  = metrics.short_interest_pct or si
+                dtc = metrics.days_to_cover or dtc
+                dtc_src = getattr(metrics, "days_to_cover_source", "")
+                dtc_est = dtc_src != "nasdaq_official"
+
+                # Now apply the real threshold. The pre-filter above ran slack on
+                # purpose, so this is where a name is held to min_dtc against the
+                # exchange's own figure.
+                if dtc < min_dtc:
+                    self._sq_write(
+                        f"  ○ {ticker:<6}  SI:{si:.0%}  "
+                        f"DTC:{dtc:.1f}d{'~' if dtc_est else ''}"
+                        f"  — below threshold on the "
+                        f"{'computed' if dtc_est else 'exchange'} figure\n",
+                        "pass_tag"
+                    )
+                    continue
 
                 # Run full squeeze analyses
                 gill_result    = None
@@ -635,7 +697,9 @@ class SqueezeSearcherApp:
 
                 if combined < min_score:
                     self._sq_write(
-                        f"  ○ {ticker:<6}  Score:{combined:.0f}  SI:{si:.0%}  DTC:{dtc:.1f}d  — score too low\n",
+                        f"  ○ {ticker:<6}  Score:{combined:.0f}  SI:{si:.0%}  "
+                        f"DTC:{dtc:.1f}d{'~' if dtc_est else ''}"
+                        f"  — score too low\n",
                         "pass_tag"
                     )
                     continue
@@ -650,6 +714,7 @@ class SqueezeSearcherApp:
                     "combined": combined,
                     "si":       si,
                     "dtc":      dtc,
+                    "dtc_source": dtc_src,
                     "ctb":      metrics.ctb_proxy,
                     "price":    metrics.current_price,
                     "mktcap":   metrics.market_cap,
@@ -663,7 +728,7 @@ class SqueezeSearcherApp:
                 self._sq_write(
                     f"  ✅ {ticker:<6}  Combined:{combined:.0f}  "
                     f"Gill:{gill_score:.0f}  Chamath:{chamath_score:.0f}  "
-                    f"SI:{si:.0%}  DTC:{dtc:.1f}d\n",
+                    f"SI:{si:.0%}  DTC:{dtc:.1f}d{'~' if dtc_est else ''}\n",
                     verdict_tag
                 )
 
@@ -1041,12 +1106,27 @@ class SqueezeSearcherApp:
                 except ImportError:
                     format_deep_display = None
 
+                try:
+                    import hypotheses as _hyp
+                except ImportError:
+                    _hyp = None
+
                 for _bidx, c in enumerate(breakdown_pool, 1):
                     self._sq_write(f"  {'='*68}\n", "dim")
                     self._sq_write(f"  #{_bidx}  {c['ticker']} — {c['company']}\n", "strong")
                     self._sq_write(f"  Deep Score: {c.get('deep_score',0):.0f}  |  "
                                    f"{c.get('deep_verdict','—')}  |  "
                                    f"Stage-1: {c['combined']:.0f}\n\n", "watch")
+                    # Declared hypotheses this name triggers. Recorded, not
+                    # scored — these are predictions under test, and the line
+                    # says so rather than reading like a call.
+                    if _hyp:
+                        _tags = _hyp.tags_for(c)
+                        if _tags:
+                            self._sq_write("  UNDER TEST (not scored):\n", "dim")
+                            for _t in _tags:
+                                self._sq_write(f"     · {_t}\n", "dim")
+                            self._sq_write("\n", "dim")
                     # Deep analysis first — it's the decision driver
                     if c.get("deep") and format_deep_display:
                         self._sq_write(format_deep_display(c["deep"]) + "\n\n", "dim")
@@ -1071,6 +1151,20 @@ class SqueezeSearcherApp:
                 self._sq_write("\n  ⚠️  squeeze_logger.py not found — scan not logged\n", "yellow")
             except Exception as le:
                 self._sq_write(f"\n  ⚠️  Logging error: {le}\n", "yellow")
+
+            # ── Standing record of the declared hypotheses ──
+            # Printed AFTER logging so this scan's rows are already in the
+            # file the record is computed from. Nothing here is scored; it
+            # exists so the forward test accumulates in view rather than
+            # being remembered.
+            try:
+                import hypotheses as _hyp
+                self._sq_write(f"\n  {'─'*70}\n", "dim")
+                self._sq_write(_hyp.format_block(), "dim")
+            except ImportError:
+                pass
+            except Exception as he:
+                self._sq_write(f"\n  ⚠️  Hypothesis record unavailable: {he}\n", "dim")
 
             self._sq_prog_lbl.config(text=f"Done — {len(candidates)} candidates")
             self._sq_status.config(text=f"Done — {len(candidates)} squeeze candidates found")

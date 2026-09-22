@@ -872,11 +872,47 @@ def analyze_options_convexity(ticker: str, current_price: float,
         otm_high = current_price * 1.30   # 30% above spot
 
         chain_rows = []   # (T_years, call_row_dicts, put_row_dicts, expiry_str)
+        chain_drops = []  # why an expiry produced no usable rows
         _now = datetime.now()
+
+        # Columns the GEX and implied-move helpers read. strike and
+        # openInterest are load-bearing; the rest are used where present.
+        _GEX_COLS = ("strike", "openInterest", "impliedVolatility",
+                     "bid", "ask", "lastPrice")
+        _GEX_REQUIRED = ("strike", "openInterest")
+
+        def _rows(df, side, exp):
+            """Chain frame -> dicts, tolerating columns yfinance omitted.
+
+            The previous version selected all six columns at once, so a
+            frame missing any ONE of them raised KeyError and the whole
+            expiry was discarded by a bare `except: pass`. The OI totals
+            below kept accumulating from the same frame, so convexity_score
+            was computed and GEX was not — a name with a perfectly good
+            chain silently produced no dealer-gamma reading, and nothing
+            anywhere said why. That is the shape of the 40% coverage gap.
+            """
+            if df is None or df.empty:
+                return []
+            missing = [c for c in _GEX_REQUIRED if c not in df.columns]
+            if missing:
+                chain_drops.append(f"{exp} {side}: no {'/'.join(missing)}")
+                return []
+            have = [c for c in _GEX_COLS if c in df.columns]
+            out = df[have].fillna(0).to_dict("records")
+            for row in out:                       # helpers index unconditionally
+                for c in _GEX_COLS:
+                    row.setdefault(c, 0.0)
+            absent = [c for c in _GEX_COLS if c not in have]
+            if absent:
+                chain_drops.append(f"{exp} {side}: defaulted {'/'.join(absent)}")
+            return out
+
         for exp in near_expiries:
             try:
                 chain = t.option_chain(exp)
-            except Exception:
+            except Exception as e:
+                chain_drops.append(f"{exp}: {type(e).__name__}")
                 continue
 
             calls = chain.calls
@@ -887,19 +923,14 @@ def analyze_options_convexity(ticker: str, current_price: float,
                 T_years = max(
                     (datetime.strptime(exp, "%Y-%m-%d") - _now).days, 1
                 ) / 365.0
-                c_rows = (calls[["strike", "openInterest",
-                                 "impliedVolatility", "bid", "ask",
-                                 "lastPrice"]]
-                          .fillna(0).to_dict("records")
-                          if calls is not None and not calls.empty else [])
-                p_rows = (puts[["strike", "openInterest",
-                                "impliedVolatility", "bid", "ask",
-                                "lastPrice"]]
-                          .fillna(0).to_dict("records")
-                          if puts is not None and not puts.empty else [])
-                chain_rows.append((T_years, c_rows, p_rows, exp))
-            except Exception:
-                pass
+                c_rows = _rows(calls, "calls", exp)
+                p_rows = _rows(puts,  "puts",  exp)
+                if c_rows or p_rows:
+                    chain_rows.append((T_years, c_rows, p_rows, exp))
+                else:
+                    chain_drops.append(f"{exp}: no usable rows either side")
+            except Exception as e:
+                chain_drops.append(f"{exp}: {type(e).__name__} normalising")
 
             if calls is not None and not calls.empty:
                 total_call_oi += int(calls["openInterest"].fillna(0).sum())
@@ -940,6 +971,23 @@ def analyze_options_convexity(ticker: str, current_price: float,
                     f"(ATM straddle — market-priced catalyst impact)")
 
         # ── DEALER GAMMA EXPOSURE: the amplification variable ──
+        # A blank gex_regime used to be indistinguishable from "not measured",
+        # "chain fetch failed" and "chain fetched but unusable". Say which,
+        # so coverage is a number someone can act on instead of a mystery.
+        if not chain_rows:
+            result.warnings.append(
+                "No dealer-gamma reading: "
+                + (f"{len(near_expiries)} expiries listed but none usable "
+                   f"({'; '.join(chain_drops[:3])})" if near_expiries
+                   else "no expiries"))
+        elif not current_price:
+            result.warnings.append(
+                "No dealer-gamma reading: no spot price to price the chain against")
+        elif chain_drops:
+            result.warnings.append(
+                f"Dealer-gamma computed on {len(chain_rows)}/"
+                f"{len(near_expiries)} expiries ({'; '.join(chain_drops[:3])})")
+
         if chain_rows and current_price:
             gex, wall = _gex_from_rows(
                 current_price, [(c[0], c[1], c[2]) for c in chain_rows[:2]])

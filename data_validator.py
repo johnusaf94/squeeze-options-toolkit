@@ -379,6 +379,12 @@ def normalise_short_interest(info: dict, ticker: str = "",
         'days_to_cover':   None,
         'short_change_pct': None,
         'data_quality':    'missing',
+        # Which vintage `days_to_cover` came from. Set on every path below so
+        # a caller never has to guess: 'nasdaq_official' is the exchange's own
+        # contemporaneous ratio, 'computed_mixed_vintage' is a settlement
+        # snapshot over a rolling 10-day volume average and can differ from it
+        # by tens of percent in either direction.
+        'dtc_source':      '',
     }
 
     shares_short  = safe_int(info, 'sharesShort')
@@ -1035,6 +1041,14 @@ def fetch_validated_info(ticker: str, enrich: bool = True) -> dict:
         'sharesShort':         si_data['shares_short'],
         'floatShares':         si_data['float_shares'],
         'shortRatio':          si_data['days_to_cover'],
+        # Vintage of shortRatio. The cheap pass (enrich=False) skips the
+        # settlement fetch and falls back to a settlement snapshot over a
+        # ROLLING 10-day volume average, which is a different quantity from
+        # the exchange's contemporaneous ratio — GME read 10.09 against the
+        # exchange's 5.31 on 2026-08-30, LCID 4.65 against 6.21. Without this
+        # marker the two are indistinguishable downstream, and a pre-filter
+        # value gets compared against vendors as if it were the real figure.
+        'shortRatioSource':    si_data.get('dtc_source', ''),
         'shortChangePercent':  si_data['short_change_pct'],
         'si_data_quality':     si_data['data_quality'],
 

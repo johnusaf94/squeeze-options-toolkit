@@ -13,7 +13,12 @@ today.
     BACKFILLABLE                      SOURCE
     reg_sho_days                      one published file per session
     exhaustion_factor, momentum_raw   daily price bars
+    dtc_exchange                      the exchange's own published ratio
     dtc_robust / dtc_60d / spike      daily volume + dated settlements
+
+Settlement-derived columns are selected on PUBLICATION date, not settlement
+date — short interest dated the 14th is not on the feed until roughly the
+26th. See SI_PUBLICATION_LAG_DAYS.
 
     NOT BACKFILLABLE                  WHY
     effective_float                   heldPercentInstitutions is a snapshot
@@ -56,11 +61,26 @@ LOG_FILE = os.path.join(_DIR, "squeeze_log.csv")
 
 # Reconstructable as of the scan date.
 BACKFILL_COLS = ["reg_sho_days", "reg_sho_mult", "exhaustion_factor",
-                 "momentum_raw", "dtc_robust", "dtc_60d", "dtc_spike_ratio",
+                 "momentum_raw", "dtc_exchange", "dtc_robust", "dtc_60d",
+                 "dtc_spike_ratio",
                  # momentum_score is momentum_raw x exhaustion_factor, and
                  # ret_5d / ret_20d / rel_volume are the price window that
                  # produced both — all pure functions of dated bars.
                  "momentum_score", "ret_5d", "ret_20d", "rel_volume"]
+
+# Short interest is dated by SETTLEMENT but not published until roughly eight
+# business days later — the 2026-08-14 settlement first appeared on the feed on
+# 2026-08-26. Selecting settlements on `settlement <= scan_date` therefore hands
+# a May row data that did not exist until June, which is lookahead of exactly
+# the kind this module refuses to commit elsewhere. Twelve calendar days is the
+# conservative reading of that lag; a settlement is treated as unavailable until
+# then.
+#
+# This tightens three columns that were already being written without the guard
+# (dtc_robust, dtc_60d, dtc_spike_ratio). Values already in the log are left
+# alone — the tool only fills blanks — so re-running does not retroactively
+# correct them. Clear those columns first if you want them rebuilt honestly.
+SI_PUBLICATION_LAG_DAYS = 12
 
 # Deliberately never written by this tool. See module docstring.
 FORWARD_ONLY = ["effective_float", "inst_shares_over_float",
@@ -204,25 +224,41 @@ def main():
                             filled[col] += 1
                     touched += 1
 
-            # ── DTC family, against the settlement current at scan time ──
-            if settlements and len(upto) >= 60:
-                prior = [s for s in settlements
-                         if s.get("settlement") and s["settlement"] <= sd.date()]
-                if prior:
-                    cur = prior[0]
-                    vol_upto = [(d, v) for d, _, v in upto]
-                    panel = dtc_engine.dtc_panel(
-                        cur.get("interest"), vol_upto,
-                        settlement=cur.get("settlement"),
-                        exchange_dtc=cur.get("dtc"),
-                        exchange_adv=cur.get("avg_volume"))
-                    for col, key in (("dtc_robust", "robust_10d_median"),
-                                     ("dtc_60d", "horizon_60d_median"),
-                                     ("dtc_spike_ratio", "spike_ratio")):
-                        v = panel.get(key)
-                        if v and not str(r.get(col, "")).strip():
-                            r[col] = round(v, 3)
-                            filled[col] += 1
+            # ── DTC family, against the settlement PUBLISHED at scan time ──
+            # Not merely settled — see SI_PUBLICATION_LAG_DAYS. A settlement
+            # dated the 14th describes the 14th but was not knowable until the
+            # 26th, and filling a scan row with data it could not have had is
+            # the one thing this tool exists to avoid.
+            cur = None
+            if settlements:
+                cutoff = sd.date() - timedelta(days=SI_PUBLICATION_LAG_DAYS)
+                published = [s for s in settlements
+                             if s.get("settlement") and s["settlement"] <= cutoff]
+                if published:
+                    cur = published[0]
+
+            # The exchange's own days-to-cover needs no price history — it is a
+            # published field, numerator and denominator both measured by the
+            # exchange over the settlement period. Write it independently of the
+            # 60-bar guard below, which exists only for the windowed variants.
+            if cur and cur.get("dtc") and not str(r.get("dtc_exchange", "")).strip():
+                r["dtc_exchange"] = round(float(cur["dtc"]), 3)
+                filled["dtc_exchange"] += 1
+
+            if cur and len(upto) >= 60:
+                vol_upto = [(d, v) for d, _, v in upto]
+                panel = dtc_engine.dtc_panel(
+                    cur.get("interest"), vol_upto,
+                    settlement=cur.get("settlement"),
+                    exchange_dtc=cur.get("dtc"),
+                    exchange_adv=cur.get("avg_volume"))
+                for col, key in (("dtc_robust", "robust_10d_median"),
+                                 ("dtc_60d", "horizon_60d_median"),
+                                 ("dtc_spike_ratio", "spike_ratio")):
+                    v = panel.get(key)
+                    if v and not str(r.get(col, "")).strip():
+                        r[col] = round(v, 3)
+                        filled[col] += 1
 
             # ── Reg SHO as of the scan date ──
             if not str(r.get("reg_sho_days", "")).strip():

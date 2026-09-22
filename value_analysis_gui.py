@@ -133,6 +133,17 @@ LADDER_CHOICES = [
     ("Off",               "off"),
 ]
 
+# What the amber corridor is measured against. Auto keeps the outside
+# yardstick when the stock has traded anywhere near it and falls back to the
+# stock's own percentiles when it has not — 15x SALES is not a standard
+# anyone uses, and drawing a corridor to it paints the whole panel one amber
+# block the price has no way of reaching.
+REF_CHOICES = [
+    ("Auto",         "auto"),
+    ("Own history",  "own"),
+    ("Outside",      "outside"),
+]
+
 # How far past the corridor a band must sit before its colour is at full
 # strength: three doublings. A band 8x cheaper than the corridor is as
 # green as the chart gets.
@@ -189,6 +200,20 @@ YIELD_RUNGS_FINE = (0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 6.0,
 # lines do not stack their labels in one column.
 LABEL_FRACTIONS = (0.13, 0.31, 0.49, 0.67, 0.85)
 REF_LABEL_FRACTION = 0.93
+
+
+def _free_slot(py, placed, lo_px, hi_px, gap=11.0):
+    """The nearest free vertical slot to `py`, searched both ways and kept
+    inside the panel. Searching upward only pushed labels off the top of a
+    crowded rail."""
+    if not any(abs(py - q) < gap for q in placed):
+        return py
+    for step in range(1, 40):
+        for cand in (py + gap * step, py - gap * step):
+            if lo_px <= cand <= hi_px and not any(
+                    abs(cand - q) < gap for q in placed):
+                return cand
+    return None
 
 
 def _label_index(band, frac):
@@ -384,6 +409,26 @@ def _how_to_read(a, mode="double"):
                 f"  RED     above {mt(refs[0][0])} — the deeper, the richer",
                 ""]
 
+    # Where the corridor edges came from. It is the single choice that moves
+    # every colour on the chart, so it is stated rather than left to be
+    # inferred from two numbers that look alike either way.
+    if a.ref_basis == "own":
+        out += ["  Both edges come from THIS STOCK's own record rather than",
+                "  an outside yardstick, so it spent half the window inside",
+                "  the amber and every zone is one the price has reached."]
+        if a.outside_pe:
+            out += [f"  The outside yardstick, {mt(a.outside_pe)}, is not "
+                    f"drawn —",
+                    "  see Reference basis in the panel below for why."]
+        out.append("")
+    elif a.ref_basis == "outside" and a.outside_pe:
+        out += [f"  One edge is {a.ticker}'s own normal multiple; the other",
+                f"  is an outside yardstick, {mt(a.outside_pe)}, the only one",
+                "  of the two that can call a whole stock expensive.",
+                "  Reference: Own history rebuilds both edges out of this",
+                "  stock's own percentiles instead.",
+                ""]
+
     if mode != "off" and yld:
         out += ["  THIN LINES are the yield grid, marked on the right edge:",
                 "    2%, 3%, 4% ... Price sitting between the 3% and the 4%",
@@ -398,7 +443,17 @@ def _how_to_read(a, mode="double"):
                 "    times that figure.",
                 ""]
 
-    if a.normal_pe and yld:
+    if a.ref_basis == "own" and a.band_lo_pe:
+        pc_lo, pc_hi = (int(q * 100) for q in ve.BAND_PCTS)
+        if yld:
+            pc_lo, pc_hi = pc_hi, pc_lo   # a low multiple is a high yield
+        out += [f"  {a.band_lo_name} {mt(a.band_lo_pe)} and "
+                f"{a.benchmark_name} {mt(a.benchmark_pe)}",
+                f"    are the {pc_lo}th and {pc_hi}th percentile of what this",
+                f"    stock actually traded at over {a.window_years} years.",
+                f"  normal {mt(a.normal_pe)} — the median, dashed, between "
+                f"them."]
+    elif a.normal_pe and yld:
         out += [f"  normal {mt(a.normal_pe)} — the yield this stock has",
                 f"    actually paid (median monthly over "
                 f"{a.window_years} years)."]
@@ -407,29 +462,34 @@ def _how_to_read(a, mode="double"):
                 f"    actually traded at (median monthly over "
                 f"{a.window_years} years)."]
 
-    if yld and a.benchmark_pe:
+    if a.ref_basis == "own":
+        pass                            # both edges already described above
+    elif yld and a.benchmark_pe:
         out += [f"  {a.benchmark_name} {mt(a.benchmark_pe)} — what government",
                 "    debt pays for taking no risk at all. Above that line",
                 "    the dividend beats bonds; below it you are paid less",
                 "    than cash for holding equity, betting the dividend",
-                "    grows into the gap.",
-                "",
-                "Price above a band means a LOWER yield than that reference.",
-                "It does not mean the stock falls — the dividend can grow",
-                "into the price instead. The lower panel plots this yield",
-                "and the Treasury together, so the gap is visible."]
+                "    grows into the gap."]
     elif yld:
         out += ["  No outside reference: the Treasury yield could not be",
-                "    fetched, so only this stock's own normal yield is drawn.",
-                "",
-                "Price above a band means a LOWER yield than that reference."]
-    else:
+                "    fetched, so only this stock's own normal yield is drawn."]
+    elif a.benchmark_pe:
         out += [f"  benchmark {mt(a.benchmark_pe)} — the outside yardstick:",
-                f"    {a.benchmark_rule.split('—')[-1].strip()}.",
-                "",
+                f"    {a.benchmark_rule.split('—')[-1].strip()}."]
+
+    if yld:
+        out += ["",
+                "Price above a band means a LOWER yield than that reference.",
+                "It does not mean the stock falls — the dividend can grow",
+                "into the price instead."]
+        if a.treasury_history:
+            out += ["The lower panel plots this yield",
+                    "and the Treasury together, so the gap is visible."]
+    else:
+        out += ["",
                 "Price above a band means the market is paying more per",
-                "dollar of earnings than that reference asks. It does not",
-                "mean the stock falls — earnings can rise into the price",
+                f"dollar of {label} than that reference asks. It does not",
+                "mean the stock falls — the business can grow into the price",
                 "instead. The lower panel shows which has been happening."]
     out += ["", "The shaded right-hand section is consensus, not history."]
     return out
@@ -600,6 +660,16 @@ class ValueAnalysisApp:
         self.ladder_var = self._dropdown(
             row3, "Multiple lines", [c[0] for c in LADDER_CHOICES],
             LADDER_CHOICES[0][0], width=17)
+        self.ref_var = self._dropdown(
+            row3, "Reference", [c[0] for c in REF_CHOICES],
+            REF_CHOICES[0][0], width=14)
+        self.show_cone = tk.BooleanVar(value=False)
+        tk.Checkbutton(row3, text="scenario cone", variable=self.show_cone,
+                       font=FONT_SM, bg=BG2, fg=FG_DIM, selectcolor=BG3,
+                       activebackground=BG2, activeforeground=FG,
+                       relief="flat", bd=0, highlightthickness=0,
+                       cursor="hand2").pack(side="left", padx=(0, 10))
+
         self.show_cover = tk.BooleanVar(value=False)
         tk.Checkbutton(row3, text="cover", variable=self.show_cover,
                        font=FONT_SM, bg=BG2, fg=FG_DIM, selectcolor=BG3,
@@ -962,8 +1032,9 @@ class ValueAnalysisApp:
                     self.basis_var):
             var.trace_add("write", self._auto_rerun)
         # View choices are drawing, not new data — redraw, never refetch.
-        for var in (self.show_div, self.show_cover, self.scale_var,
-                    self.ladder_var, self.fit_var):
+        for var in (self.show_div, self.show_cover, self.show_cone,
+                    self.scale_var, self.ladder_var, self.fit_var,
+                    self.ref_var):
             var.trace_add("write", self._auto_redraw)
 
     def _auto_rerun(self, *_):
@@ -985,10 +1056,16 @@ class ValueAnalysisApp:
     def _auto_redraw(self, *_):
         """Redraw from the analysis already in hand — no network, no refetch.
         The panel goes with it, because the scale note describes the axis
-        currently on screen."""
+        currently on screen, and the meter goes with it because the choice
+        of reference is one of the things the meter scores against."""
         if self.analysis and not self.analysis.error:
+            self.analysis.set_reference(self._ref_mode())
+            self._render_meter(self.analysis)
             self._render_text(self.analysis)
             self._draw(self.analysis)
+
+    def _ref_mode(self):
+        return dict(REF_CHOICES).get(self.ref_var.get(), "auto")
 
     # ─────────────────────────────────────────
     # RUN
@@ -1066,6 +1143,7 @@ class ValueAnalysisApp:
             RED if a.warnings else GREEN)
         self.source_lbl.config(
             text=f"SEC CIK {a.cik} · {a.source_tag or ''}")
+        a.set_reference(self._ref_mode())
         self._render_meter(a)
         self._render_text(a)
         self._draw(a)
@@ -1336,19 +1414,29 @@ class ValueAnalysisApp:
         if not log_scale:
             ax.axhspan(-ceil_fill, 0.0, facecolor=RED, alpha=0.10, zorder=0)
             ax.axhline(0.0, color=RED, linewidth=0.8, alpha=0.55, zorder=2)
+            # Clipped to the panel: the zero line is usually far below the
+            # view, and an unclipped annotation anchored to it printed
+            # itself across the multiple panel underneath.
             ax.annotate("below $0 — no price lives here", xy=(0.5, 0.0),
                         xycoords=("axes fraction", "data"),
                         xytext=(0, -7), textcoords="offset points",
                         ha="center", va="top", color=RED, fontsize=7.5,
-                        alpha=0.85, zorder=6)
+                        alpha=0.85, zorder=6, clip_on=True,
+                        annotation_clip=True)
 
         for k in rungs:
             ax.plot(grid, [b * k for b in band], color=RUNG, linewidth=0.75,
                     alpha=0.6, zorder=3)
-        # the corridor edges, heavier than the ruler
+        # The corridor edges, heavier than the ruler. A reference BETWEEN
+        # them — the median, when the corridor is the stock's own 25th to
+        # 75th percentile — is drawn lighter and dashed, because it marks a
+        # level inside the band rather than a boundary of it.
         for mult in ref_mults:
+            edge = mult in (lo_mult, hi_mult)
             ax.plot(grid, [b * mult for b in band], color=ACCENT,
-                    linewidth=1.8, zorder=4)
+                    linewidth=1.8 if edge else 1.1,
+                    linestyle="-" if edge else (0, (5, 3)),
+                    alpha=1.0 if edge else 0.75, zorder=4)
 
         # ── stretches where no multiple exists ──
         # A loss year has no multiple, so no band is drawn across it. Saying
@@ -1418,7 +1506,10 @@ class ValueAnalysisApp:
         # Where bear and bull land, drawn geometrically so the path is a
         # straight line on the log axis and a curve on the linear one —
         # the same compounding either way.
-        scen = a.scenarios()
+        # Off by default: the numbers it draws are already written out in
+        # full beside the meter, and twelve years of history should not be
+        # sharing the panel with a fan of guesses about the next five.
+        scen = a.scenarios() if self.show_cone.get() else None
         if scen and a.price_now:
             t0, p0 = date.today(), a.price_now
             span_days = max((scen["target"] - t0).days, 1)
@@ -1479,10 +1570,12 @@ class ValueAnalysisApp:
             beyond = max((v * m for v in a.forecast_values if v and v > 0
                           for m, _n in refs), default=0.0)
             if beyond > hi_y:
-                ax.text(a.fiscal_dates[-1], 0.94,
-                        "  forecast runs above this scale — Fit: All data",
+                # Anchored to the left of the forecast divider so it runs
+                # back over the history instead of into the right rail.
+                ax.text(a.fiscal_dates[-1], 0.985,
+                        "forecast runs above this scale — Fit: All data  ",
                         transform=ax.get_xaxis_transform(), color=FG_DIM,
-                        fontsize=7.5, va="top", zorder=8)
+                        fontsize=7.5, va="top", ha="right", zorder=8)
 
         label = ve.METRIC_LABELS.get(a.metric, a.metric)
         ax.set_title(f"{a.ticker} — price against {label}", color=FG,
@@ -1516,7 +1609,13 @@ class ValueAnalysisApp:
         rail_x = x1 + span * 0.015
 
         rail = []
-        end_b = band[-1] if band else NAN
+        # The LAST REAL value, not the last one. The band runs NaN past the
+        # end of the filings and across a loss, and anchoring the rail to
+        # band[-1] meant that every chart without a consensus forecast, and
+        # every company whose last year was a loss, lost its entire rail —
+        # Ford's 2025 loss and Wynn's suspended dividend both printed a
+        # chart with no reference labels on it at all.
+        end_b = next((b for b in reversed(band) if b == b), NAN)
         if end_b == end_b:
             rail += [(mult * end_b, 0,
                       f"{name} {ve.mult_text(a.metric, mult)}  "
@@ -1533,20 +1632,36 @@ class ValueAnalysisApp:
                        else f"  {r['annualised']:+.0%}/yr"), TEAL, "bold")
                      for r in scen["rows"]]
 
+        # A reference or a scenario endpoint above the top of the scale is
+        # pinned to the edge with an arrow rather than dropped. Silently
+        # omitting it is how the bull case went missing on every chart whose
+        # forecast sits above the visible range — which, with Fit on Auto
+        # and a linear axis, is most of them.
+        box = ax.get_window_extent()
+        lo_px, hi_px = box.y0 + 9.0, box.y1 - 9.0
         placed = []
         for y, prio, text, color, weight in sorted(rail,
                                                    key=lambda r: (r[1], -r[0])):
-            if not lo_y < y < hi_y:
-                continue
             py = ax.transData.transform((rail_x, y))[1]
-            if any(abs(py - q) < 11 for q in placed):
+            arrow = ""
+            if py > hi_px:
                 if prio == 2:
                     continue                  # a ruler line can be dropped
-                while any(abs(py - q) < 11 for q in placed):
-                    py += 11                  # a reference is nudged clear
-                y = ax.transData.inverted().transform((0, py))[1]
-            placed.append(py)
-            ax.text(rail_x, y, text, color=color, fontsize=7.5,
+                # The arrow means "off the scale", so it is earned by the
+                # value, not by sitting within a few pixels of the frame.
+                py, arrow = hi_px, ("↑ " if y > hi_y else "")
+            elif py < lo_px:
+                if prio == 2:
+                    continue
+                py, arrow = lo_px, ("↓ " if y < lo_y else "")
+            slot = _free_slot(py, placed, lo_px, hi_px)
+            if slot is None:
+                if prio == 2:
+                    continue
+                slot = py                     # crowded, but never silent
+            placed.append(slot)
+            ax.text(rail_x, ax.transData.inverted().transform((0, slot))[1],
+                    arrow + text, color=color, fontsize=7.5,
                     fontweight=weight, va="center", ha="left", zorder=8)
 
         # Decided before the legend is built, drawn after it with the lower
@@ -1585,6 +1700,11 @@ class ValueAnalysisApp:
                       label=(f"yield below {lo_name} {mt(lo_mult)}" if yld
                              else f"richer than {lo_name} {mt(lo_mult)}")),
             ]
+        if len(refs) > 2 and a.normal_pe:
+            handles.append(Line2D(
+                [], [], color=ACCENT, linewidth=1.1, linestyle=(0, (5, 3)),
+                label=(f"normal {mt(a.normal_pe)} — the median, inside the "
+                       f"corridor")))
         if rungs:
             handles.append(Line2D(
                 [], [], color=RUNG, linewidth=0.9,

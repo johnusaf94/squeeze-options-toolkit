@@ -48,13 +48,20 @@ class SqueezeMetrics:
     float_shares:            Optional[int]   = None
     avg_daily_volume:        Optional[float] = None
     days_to_cover:           Optional[float] = None
+    # Vintage of days_to_cover: 'nasdaq_official' (the exchange's own
+    # contemporaneous ratio) or 'computed_mixed_vintage' (settlement snapshot
+    # over a ROLLING 10-day volume average). The cheap pass only ever produces
+    # the latter, and the two disagreed by a median 28.6% on the graded rows
+    # carrying both. Anything that displays, gates on, or logs days_to_cover
+    # must say which one it holds.
+    days_to_cover_source:    str = ""
     ctb_proxy:               Optional[float] = None
     si_data_quality:         str = ""
 
-    # Days to cover by named volume window. days_to_cover above stays the
-    # exchange figure; these are the same settlement measured against
-    # different denominators, because the denominator is what the
-    # disagreements are actually about.
+    # Days to cover by named volume window. days_to_cover above is the
+    # exchange figure ONLY on the enriched path — see days_to_cover_source.
+    # These are the same settlement measured against different denominators,
+    # because the denominator is what the disagreements are actually about.
     dtc_exchange:            Optional[float] = None
     dtc_robust:              Optional[float] = None   # 10-session MEDIAN
     dtc_20d:                 Optional[float] = None
@@ -249,6 +256,7 @@ def fetch_squeeze_metrics(ticker: str, enrich: bool = True) -> SqueezeMetrics:
         m.shares_short           = v.get('sharesShort')
         m.float_shares           = v.get('floatShares')
         m.days_to_cover          = v.get('shortRatio')
+        m.days_to_cover_source   = v.get('shortRatioSource', '') or ''
         m.short_change_pct       = v.get('shortChangePercent')
         m.si_data_quality        = v.get('si_data_quality', '')
 
@@ -749,6 +757,39 @@ def run_chamath_analysis(ticker: str) -> ChamathAnalysis:
 # DISPLAY FORMATTERS
 # ─────────────────────────────────────────────
 
+def _dtc_line(m: SqueezeMetrics) -> str:
+    """The days-to-cover line, with its denominator named and its band shown.
+
+    A bare DTC number is not a fact. It is a ratio against a volume window the
+    reader cannot see, and the window is a free parameter. GME on the
+    2026-08-14 settlement reads 5.31 against the exchange's 10-session mean,
+    8.49 against the median of that same window, and 11.94 against a
+    60-session median. All three are arithmetically correct; they answer
+    different questions. Quoting one figure without its denominator is what
+    turns a routine vendor difference into an unresolvable argument — a
+    platform showing 12 for GME is inside that band, not wrong.
+
+    So: name the vintage, and print the band where the panel supplies one.
+    """
+    v = m.days_to_cover
+    if v is None:
+        return "  Days to Cover (DTC):     N/A                      threshold > 5 days"
+    src = m.days_to_cover_source or ""
+    tag = ("exchange" if src == "nasdaq_official"
+           else "computed~" if src else "")
+    head = f"{v:.1f}" + (f"  [{tag}]" if tag else "")
+    out = [f"  Days to Cover (DTC):     {head:<24} threshold > 5 days"]
+    lo, hi = m.dtc_spread_low, m.dtc_spread_high
+    if lo and hi and hi > lo:
+        band = f"{lo:.1f}–{hi:.1f}"
+        note = "  (denominator choice alone)"
+        if m.dtc_spike_contaminated and m.dtc_spike_ratio:
+            note = (f"  spike-contaminated: 10d mean sits "
+                    f"{m.dtc_spike_ratio:.2f}x its median")
+        out.append(f"  DTC band by window:      {band:<24}{note}")
+    return "\n".join(out)
+
+
 def format_gill_display(g: GillAnalysis) -> str:
     m = g.metrics
 
@@ -762,7 +803,7 @@ def format_gill_display(g: GillAnalysis) -> str:
         "",
         f"  ── SQUEEZE SETUP ({g.squeeze_setup_score:.0f}/44) ────────────────────────────────",
         f"  Short Interest % Float:  {pct(m.short_interest_pct):<14}{si_note}",
-        f"  Days to Cover (DTC):     {n(m.days_to_cover, 1):<14} threshold > 5 days",
+        _dtc_line(m),
         f"  Cost-to-Borrow Proxy:    {n(m.ctb_proxy, 1)}%       threshold > 10%",
         f"  Short Change (1mo):      {pct(m.short_change_pct):<14} (+ = shorts adding)",
         f"  FTD % of Float:          {pct(m.ftd_pct_float, 3):<14} [{m.ftd_report_date or 'no SEC data'}]",
@@ -811,7 +852,7 @@ def format_chamath_display(c: ChamathAnalysis) -> str:
         "",
         f"  ── SQUEEZE PRESSURE ({c.squeeze_pressure_score:.0f}/35) ──────────────────────────────",
         f"  Short Interest % Float:  {pct(m.short_interest_pct):<14}{si_note}",
-        f"  Days to Cover (DTC):     {n(m.days_to_cover, 1):<14} threshold > 5 days",
+        _dtc_line(m),
         f"  Cost-to-Borrow Proxy:    {n(m.ctb_proxy, 1)}%",
         f"  FTD % of Float:          {pct(m.ftd_pct_float, 3):<14}",
         f"  FTD % of EFF Float:      {pct(m.ftd_pct_eff_float, 3):<14}"

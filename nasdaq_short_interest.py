@@ -14,9 +14,16 @@ Days-to-cover was being computed as:
 That ratio mixes vintages. The numerator is frozen between settlements while
 the denominator moves every session, so DTC falls purely because volume rose —
 which is precisely what happens when a squeeze starts. Low DTC was therefore
-partly a recent-volume-surge detector wearing a short-crowding costume, and
-days-to-cover is the single strongest correlate with forward returns in the
-graded log (-0.34), pointing the opposite way to how the scanner scores it.
+partly a recent-volume-surge detector wearing a short-crowding costume.
+
+This module was originally justified by DTC being "the single strongest
+correlate with forward returns in the graded log (-0.34)". That number was
+real on the snapshot it was measured against and is no longer: on the current
+log it is -0.201 pooled and +0.003 with one row per ticker, and on Spearman
+rank it changes sign between the two. The correlation argument is withdrawn.
+The vintage argument is not, and it never depended on the correlation: mixing
+a frozen numerator with a moving denominator is wrong whether or not the
+resulting number happens to predict anything.
 
 NASDAQ publishes, for every settlement date, the short interest AND the average
 daily volume measured over that same settlement period, AND the resulting days

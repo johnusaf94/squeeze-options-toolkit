@@ -109,14 +109,53 @@ def _f(v, default=None):
 #      where ~all |values| <= 1.5 is fraction-coded beyond reasonable
 #      doubt. Convert x100.
 
-_PRICE_PAIRS_10D = (("price_at_entry", "price_10d"),
-                    ("entry_price", "price_10d"),
-                    ("price_at_scan", "price_10d"),
-                    ("price_at_log", "price_10d"))
+# Entry-price column names, in preference order. The log has used four of
+# them across schema revisions and any given row carries exactly one.
+_ENTRY_PRICE_COLS = ("price_at_entry", "entry_price",
+                     "price_at_scan", "price_at_log")
+
+# Every horizon the log grades.
+#
+# TWO CONVENTIONS, ONE FILE
+# squeeze_log.csv stores returns as FRACTIONS on disk (0.15 = +15%). This
+# module converts to PERCENT in memory and compares against CALIB_TARGET_RET
+# = 15.0; review_outcomes.py reads the same file untouched and compares
+# against 0.15. Both are internally consistent and neither is wrong — but
+# only return_10d was being converted, so inside THIS module return_5d and
+# return_20d sat in fractions while return_10d sat in percent, and the unit
+# a column carried depended on which one you asked for. Measured before the
+# fix: return_20d had a 95th-percentile absolute value of 0.488, so any
+# percent threshold applied to it returned 0% for every bucket including the
+# base rate — a silent, plausible-looking zero rather than an error.
+#
+# No shipped consumer was reading it that way, because the ones that touched
+# return_20d read correlations, which are scale-invariant. The exposure was
+# to the next thing written, and it took about an hour to catch when that
+# thing was written.
+#
+# Normalizing every horizon removes the split. On-disk stays fractional;
+# nothing here writes back.
+_RETURN_HORIZONS = ("return_5d", "return_10d", "return_20d")
+
+
+def _price_pairs(ret_col: str) -> tuple:
+    """(entry, exit) price column candidates for a return column.
+
+    return_10d -> price_10d, return_20d -> price_20d, and so on, so a new
+    horizon needs no second place to register it."""
+    exit_col = "price_" + ret_col.split("_", 1)[1]
+    return tuple((e, exit_col) for e in _ENTRY_PRICE_COLS)
 
 
 def _normalize_return_units(rows: list, ret_col: str = "return_10d") -> dict:
-    """Normalize rows[*][ret_col] to PERCENT in place (in memory).
+    """Normalize rows[*][ret_col] to PERCENT in place (in memory only).
+
+    The CSV on disk is fraction-coded and stays that way — these dicts came
+    from csv.DictReader and are never written back. Call this for every
+    horizon a caller will read, not just the one it reads first: a module
+    holding return_10d in percent and return_20d in fractions is the shape
+    of the bug this exists to prevent.
+
     Returns a note dict describing what was done, for evidence/report."""
     note = {"col": ret_col, "n": 0, "price_recomputed": 0,
             "converted_x100": 0, "verdict": "no graded rows"}
@@ -129,7 +168,7 @@ def _normalize_return_units(rows: list, ret_col: str = "return_10d") -> dict:
     remaining = []
     for r in graded:
         done = False
-        for c0, c1 in _PRICE_PAIRS_10D:
+        for c0, c1 in _price_pairs(ret_col):
             p0, p1 = _f(r.get(c0)), _f(r.get(c1))
             if p0 and p1 and p0 > 0:
                 r[ret_col] = round((p1 / p0 - 1.0) * 100.0, 3)
@@ -163,7 +202,9 @@ def _normalize_return_units(rows: list, ret_col: str = "return_10d") -> dict:
     return note
 
 
-# Populated on each _graded_squeeze_rows() call; surfaced in params + report
+# Populated on each _graded_squeeze_rows() call; surfaced in params + report.
+# Holds the return_10d note at the top level so existing readers keep working,
+# with every horizon's note under "by_horizon".
 _LAST_UNITS_NOTE = {}
 
 
@@ -261,7 +302,12 @@ def _graded_squeeze_rows() -> list:
         return []
     with open(SQUEEZE_LOG, newline="", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
-    _LAST_UNITS_NOTE = _normalize_return_units(rows, "return_10d")
+    # Normalize EVERY graded horizon, not just the one the calibration reads.
+    # A column left fraction-coded is not inert: it silently fails any percent
+    # threshold applied to it, and reports the failure as a legitimate 0%.
+    notes = {c: _normalize_return_units(rows, c) for c in _RETURN_HORIZONS}
+    _LAST_UNITS_NOTE = dict(notes["return_10d"])
+    _LAST_UNITS_NOTE["by_horizon"] = notes
     out = []
     for r in rows:
         if not r.get("outcome_checked") or _f(r.get("return_10d")) is None:
@@ -521,19 +567,58 @@ def derive_stock_params(stats: dict) -> dict:
 # every weight is inspectable in learned_params.json.
 #
 # HARD GATES (stricter than the bounded-adjustment stage):
-#   - >= 150 graded rows
-#   - >= 20 winners AND >= 20 losers (no degenerate fits)
+#   - >= 150 independent EPISODES
+#   - >= 20 winning episodes AND >= 20 losing episodes (no degenerate fits)
 # Until both hold, "calibration": {"active": false} and the scanners
 # show nothing. A probability fitted on 40 rows is a lie with decimals.
+#
+# WHY EPISODES AND NOT ROWS
+# The holdout split below was already made group-aware, because the same
+# ticker recurs across daily scans and a plain chronological cut let one
+# episode straddle the boundary. The GATE was left counting raw rows, which
+# reintroduced the same overcounting one line earlier: 2,419 rows collapsing
+# to ~694 episodes sailed past a "150+ rows" floor on roughly 3.5x the
+# evidence it appeared to have.
+#
+# The concentration is not mild. Of 2,430 graded rows carrying both a forward
+# return and a days-to-cover, the ten most-scanned tickers supply 29% —
+# CRMD and TGTX at 90 rows each, RH at 84. A correlation computed across all
+# rows is substantially a measurement of how those ten names happened to
+# perform, restated eighty times. The DTC feature's headline correlation with
+# forward return survives that pooling at -0.201 and collapses to +0.003 with
+# one row per ticker; on Spearman rank it changes sign. Whatever the gate is
+# protecting against, it cannot protect against it while counting rows.
 
-CALIB_MIN_ROWS = 150
-CALIB_MIN_CLASS = 20
+CALIB_MIN_ROWS = 150         # raw graded rows — the floor for having any data
+CALIB_MIN_EPISODES = 150     # independent (ticker, 5-day) episodes — the real gate
+CALIB_MIN_CLASS = 20         # winning / losing EPISODES, not rows
 CALIB_TARGET_RET = 15.0      # "winner" = return_10d > +15%
 
 CALIB_FEATURES = [
     # (name, extractor from a graded squeeze_log row, default)
     ("si_pct",          lambda r: _f(r.get("si_pct")), None),
-    ("dtc",             lambda r: min(_f(r.get("dtc"), 0) or 0, 20.0), None),
+    # Days to cover, preferring the exchange's own published ratio and falling
+    # back to the logged column only where no settlement was available.
+    #
+    # This is not a new feature — it is the same feature finally reading the
+    # quantity its name always claimed. The `dtc` column was documented as the
+    # exchange figure, but the searcher captured it from the CHEAP pre-filter
+    # pass and never refreshed it after enrichment, so what actually reached
+    # the log was a settlement snapshot over a ROLLING 10-day volume average.
+    # The two are different quantities: on rows carrying both they disagreed
+    # 23% of the time, by a median 28.6% and a maximum 351.6% (JACK logged
+    # 10.30 against an exchange 5.37; NVAX 8.50 against 14.03).
+    #
+    # The mixed-vintage version has a specific pathology that matters here.
+    # Its denominator is recent volume, so it FALLS when volume surges — which
+    # is what the beginning of a squeeze looks like. A model that reads low DTC
+    # as bearish is, in that regime, penalising exactly the setups the scanner
+    # exists to find. The exchange version measures numerator and denominator
+    # over the same settlement period and cannot do that.
+    ("dtc",             lambda r: min(_f(r.get("dtc_exchange"))
+                                      if _f(r.get("dtc_exchange")) is not None
+                                      else (_f(r.get("dtc"), 0) or 0), 20.0),
+     None),
     ("ctb",             lambda r: min(_f(r.get("ctb"), 0) or 0, 150.0), None),
     ("conviction_mult", lambda r: _f(r.get("conviction_mult"), 1.0), 1.0),
     ("sweet_spot",      lambda r: 1.0 if r.get("catalyst_window") == "SWEET_SPOT" else 0.0, 0.0),
@@ -557,12 +642,29 @@ CALIB_FEATURES = [
     ("inst_over_float", lambda r: (None if _f(r.get("inst_shares_over_float")) is None
                                    else min(_f(r.get("inst_shares_over_float")), 5.0)),
      None),
-    # Spike-robust days to cover. Added because DTC is already the strongest
-    # single correlate with forward returns in the graded log (-0.34) and the
-    # `dtc` column measures it against a 10-session MEAN, which a single
-    # volume spike can move by 60% (GME 2026-08-14: 5.31 on the mean, 8.49 on
-    # the median of the same window). If DTC carries signal, the version not
-    # set by outlier sessions should carry more of it.
+    # Spike-robust days to cover: the same 10-session window as the exchange,
+    # median instead of mean, so a single outsized session cannot set the
+    # answer (GME 2026-08-14: 5.31 on the mean, 8.49 on the median of the same
+    # window). If DTC carries signal, the version not set by outliers should
+    # carry more of it.
+    #
+    # WHAT THE ORIGINAL JUSTIFICATION SAID, AND WHY IT NO LONGER STANDS
+    # This was added on the grounds that DTC is "the strongest single
+    # correlate with forward returns in the graded log (-0.34)". That figure
+    # was real when measured — it reproduces at -0.368 on the 2026-08-24
+    # snapshot and -0.353 on the 2026-08-29 pre-regrade snapshot — but it does
+    # not survive contact with either of the two corrections since:
+    #
+    #     current log, all rows, return_20d          -0.201
+    #     current log, one row per ticker            +0.003
+    #     Spearman, all rows / per ticker      -0.048 / +0.147   (sign flips)
+    #
+    # It was also measured on the mixed-vintage `dtc` column rather than the
+    # exchange figure. So the claim is retired, not restated: DTC may carry
+    # signal, but the evidence that it is the strongest correlate does not
+    # currently exist. Keeping the feature is defensible; asserting its
+    # primacy in a comment is not, because that is how a weak feature acquires
+    # unearned tenure.
     #
     # Only this one of the DTC family is registered. dtc_60d and the spike
     # ratio are logged and available, but this fit already fails its own AUC
@@ -1082,9 +1184,41 @@ def derive_calibration(rows) -> dict:
     if diag.get("fatal"):
         out["gate"] = f"data quality: {diag['fatal']}"
         return out
-    if n < CALIB_MIN_ROWS or pos < CALIB_MIN_CLASS or (n - pos) < CALIB_MIN_CLASS:
-        out["gate"] = (f"needs {CALIB_MIN_ROWS}+ rows with {CALIB_MIN_CLASS}+ "
-                       f"each side (have {n}: {pos}W/{n-pos}L)")
+
+    # ── the gate counts EPISODES, not rows ──
+    # An episode is (ticker, 5-day window); the same candidate reappearing in
+    # tomorrow's scan is the same setup still running, not a second
+    # observation. An episode is a winner if ANY of its rows cleared the
+    # target, which is the honest reading of "did this setup work" — the rows
+    # within an episode are the same setup sampled on consecutive days, so
+    # requiring all of them to clear would penalise a setup for being logged
+    # more often.
+    groups = diag.get("episodes") or []
+    if groups and len(groups) == n:
+        ep_label = {}
+        for g, yi in zip(groups, y):
+            ep_label[g] = max(ep_label.get(g, 0.0), yi)
+        eff_n = len(ep_label)
+        eff_pos = int(sum(ep_label.values()))
+    else:
+        # No episode keys — fall back to rows and say so, rather than
+        # silently passing a gate on evidence that was never counted.
+        eff_n, eff_pos = n, pos
+        out["episode_keys_missing"] = True
+    out["effective_n"] = eff_n
+    out["winning_episodes"] = eff_pos
+    out["losing_episodes"] = eff_n - eff_pos
+    out["rows_per_episode"] = round(n / max(eff_n, 1), 2)
+
+    if n < CALIB_MIN_ROWS:
+        out["gate"] = (f"needs {CALIB_MIN_ROWS}+ graded rows "
+                       f"(have {n}: {pos}W/{n-pos}L)")
+        return out
+    if (eff_n < CALIB_MIN_EPISODES or eff_pos < CALIB_MIN_CLASS
+            or (eff_n - eff_pos) < CALIB_MIN_CLASS):
+        out["gate"] = (f"needs {CALIB_MIN_EPISODES}+ independent episodes with "
+                       f"{CALIB_MIN_CLASS}+ each side (have {eff_n} episodes "
+                       f"from {n} rows: {eff_pos}W/{eff_n-eff_pos}L)")
         return out
 
     # ── chronological holdout, GROUP-AWARE ──
@@ -1099,14 +1233,14 @@ def derive_calibration(rows) -> dict:
     # So: cut on the episode boundary, and never let one episode land on both
     # sides. Effective sample size is also reported, because "n=2419" invites
     # exactly the overconfidence this is correcting.
-    groups = diag.get("episodes") or []
     cut = int(n * (1.0 - CALIB_HOLDOUT_FRAC))
     if groups and len(groups) == n:
         # walk the cut forward until the group changes, so no episode splits
         while cut < n - 1 and groups[cut] == groups[cut - 1]:
             cut += 1
-        out["effective_n"] = len(set(groups))
-        out["rows_per_episode"] = round(n / max(len(set(groups)), 1), 2)
+        # effective_n / rows_per_episode are set at the gate above, on the same
+        # `groups` list — one source, so the reported figure and the gated
+        # figure can never drift apart.
     Xtr, ytr, Xte, yte = X[:cut], y[:cut], X[cut:], y[cut:]
     if (not yte or sum(yte) < 5 or (len(yte) - sum(yte)) < 5
             or not ytr or sum(ytr) < 5):
@@ -1208,12 +1342,13 @@ def update_from_logs(grade_stock: bool = True) -> dict:
 
     sq_rows = _graded_squeeze_rows()
     st_rows = _graded_stock_rows()
-    if _LAST_UNITS_NOTE.get("n"):
-        print(f"  return units [{_LAST_UNITS_NOTE['col']}]: "
-              f"{_LAST_UNITS_NOTE['verdict']} "
-              f"(n={_LAST_UNITS_NOTE['n']}, "
-              f"price-recomputed={_LAST_UNITS_NOTE['price_recomputed']}, "
-              f"x100-converted={_LAST_UNITS_NOTE['converted_x100']})")
+    for _note in (_LAST_UNITS_NOTE.get("by_horizon")
+                  or {"": _LAST_UNITS_NOTE}).values():
+        if _note.get("n"):
+            print(f"  return units [{_note['col']}]: {_note['verdict']} "
+                  f"(n={_note['n']}, "
+                  f"price-recomputed={_note['price_recomputed']}, "
+                  f"x100-converted={_note['converted_x100']})")
 
     params = {
         "version": 1,

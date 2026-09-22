@@ -12,7 +12,8 @@ plot split-adjusted price against a line drawn at a fixed multiple of the
 company's own reported earnings, so "expensive" and "cheap" get read
 against the earnings stream rather than against a chart pattern.
 
-Two reference lines are drawn:
+The corridor between two reference lines can be built either way round,
+and set_reference() decides which (Auto, by default):
 
   * BENCHMARK line — earnings x 15. Fifteen times earnings is roughly the
     long-run average multiple of the US market, and the multiple Graham
@@ -24,6 +25,12 @@ Two reference lines are drawn:
     over the selected window (median of the monthly P/E). A stock that
     has spent fifteen years at 25x is not "40% overvalued" at 22x merely
     because the market average is 15x.
+
+  * Or, where the outside yardstick lands somewhere this stock has never
+    traded, the corridor is its OWN 25th and 75th percentile, with the
+    median dashed between them. Fifteen times SALES is not a convention
+    anyone uses, and a corridor drawn to it on a revenue chart is a zone
+    the price has no way of reaching.
 
 Neither line is a forecast. Both are descriptions — one of a market
 convention, one of this stock's own history. What they add is a fixed,
@@ -97,6 +104,18 @@ TICKERMAP_TTL = timedelta(days=7)
 # average market P/E, and the level Graham used for a no-growth buy.
 BENCHMARK_PE = 15.0
 BENCHMARK_PE_CAP = 30.0     # PEG multiple ceiling for fast compounders
+
+# The corridor drawn when the reference is the stock's own record: the range
+# it traded inside half the time. Under the lower edge it is cheaper than it
+# has been three quarters of its history; over the upper edge, dearer.
+BAND_PCTS = (0.25, 0.75)
+
+# How far outside its own lived range an outside yardstick may sit before
+# Auto stops using it as a corridor edge. Fifteen times sales is a real
+# number for a software company; for a pizza franchise that has never in
+# fifteen years traded over 1.6x sales it is a wall on the far side of an
+# empty room, and it turns the whole chart into one unreachable amber block.
+OUTSIDE_REACH = 1.5
 
 # Filings whose numbers are the primary record. Restatements arriving in
 # an 8-K are used only when nothing better covers the period.
@@ -1145,6 +1164,18 @@ class ValueAnalysis:
     benchmark_pe: Optional[float] = BENCHMARK_PE
     benchmark_name: str = "benchmark"
     benchmark_rule: str = ""
+    # The stock's own multiple distribution over the window, and the outside
+    # yardstick kept aside, so the corridor can be rebuilt from either one
+    # without refetching anything.
+    pe_pcts: Dict[float, float] = field(default_factory=dict)
+    outside_pe: Optional[float] = None
+    outside_name: str = "benchmark"
+    outside_rule: str = ""
+    band_lo_pe: Optional[float] = None       # lower corridor edge, own basis
+    band_lo_name: str = ""
+    ref_mode: str = "auto"                   # what was asked for
+    ref_basis: str = "outside"               # what is actually drawn
+    ref_reason: str = ""
     treasury_pct: Optional[float] = None    # 10-year yield, percent
     treasury_history: List[Tuple[date, float]] = field(default_factory=list)
     current_pe: Optional[float] = None       # price / blended metric today
@@ -1231,7 +1262,80 @@ class ValueAnalysis:
         always distrusted can sit under 15x for its whole history."""
         return sorted((m, n) for m, n in
                       ((self.normal_pe, "normal"),
+                       (self.band_lo_pe, self.band_lo_name),
                        (self.benchmark_pe, self.benchmark_name)) if m)
+
+    def set_reference(self, mode: str = "auto") -> str:
+        """Choose what the amber corridor is measured against, and return
+        the basis actually used.
+
+        OUTSIDE is a yardstick from outside the company: fifteen times
+        earnings, or the Treasury yield for a dividend. It is the only one
+        of the two that can call a whole stock expensive, which is what
+        catches a company whose own history was itself a bubble.
+
+        OWN is this stock's own 25th and 75th percentile over the window —
+        the range it traded inside half the time. Every zone is reachable by
+        construction, because the stock built them.
+
+        AUTO takes the outside yardstick when the stock has traded anywhere
+        near it, and its own record when it has not. Fifteen times SALES is
+        not a standard anyone uses: on a revenue chart that line lands miles
+        over the price and paints the whole panel one amber block the price
+        has no way of reaching.
+        """
+        p_lo, p_hi = (self.pe_pcts.get(q) for q in BAND_PCTS)
+        wide_lo, wide_hi = self.pe_pcts.get(0.05), self.pe_pcts.get(0.95)
+        have_own = bool(p_lo and p_hi and self.normal_pe and p_lo < p_hi)
+
+        basis, reason = mode, ""
+        if mode == "auto":
+            if not self.outside_pe:
+                basis, reason = "own", "no outside yardstick fits this metric"
+            elif not have_own:
+                basis, reason = "outside", "too little multiple history"
+            elif (wide_lo and wide_hi
+                  and not (wide_lo / OUTSIDE_REACH <= self.outside_pe
+                           <= wide_hi * OUTSIDE_REACH)):
+                basis = "own"
+                reason = (
+                    f"{mult_text(self.metric, self.outside_pe)} is outside "
+                    f"anything {self.ticker} has traded at — its own range "
+                    f"over the window runs "
+                    f"{mult_text(self.metric, wide_lo)} to "
+                    f"{mult_text(self.metric, wide_hi)} — so a corridor "
+                    f"drawn to it would be a zone the price cannot reach")
+            else:
+                basis = "outside"
+                reason = (f"{mult_text(self.metric, self.outside_pe)} sits "
+                          f"inside the range {self.ticker} has traded at")
+        if basis == "own" and not have_own:
+            basis, reason = "outside", "too little multiple history"
+        if basis == "outside" and not self.outside_pe:
+            basis = "own" if have_own else "outside"
+            reason = "no outside yardstick fits this metric"
+
+        self.ref_mode, self.ref_basis, self.ref_reason = mode, basis, reason
+        if basis == "own" and have_own:
+            # Named by what they mean, not by their percentile number: for a
+            # dividend the LOW multiple is the HIGH yield, and a label that
+            # says "25th" beside a percentage reads backwards.
+            lo_n, hi_n = (("usual high", "usual low")
+                          if is_yield_metric(self.metric)
+                          else ("usual low", "usual high"))
+            self.band_lo_pe, self.band_lo_name = p_lo, lo_n
+            self.benchmark_pe, self.benchmark_name = p_hi, hi_n
+            self.benchmark_rule = (
+                f"{mult_text(self.metric, p_lo)} to "
+                f"{mult_text(self.metric, p_hi)} — this stock's own 25th and "
+                f"75th percentile over the window, the middle half of its "
+                f"own record")
+        else:
+            self.band_lo_pe, self.band_lo_name = None, ""
+            self.benchmark_pe = self.outside_pe
+            self.benchmark_name = self.outside_name
+            self.benchmark_rule = self.outside_rule
+        return basis
 
     def zone(self) -> Optional[dict]:
         """Which of the chart's three bands the price is standing in today,
@@ -1245,11 +1349,12 @@ class ValueAnalysis:
                   "gap": m * mult / self.price_now - 1.0}
                  for mult, n in refs]
         if self.price_now < lines[0]["value"]:
-            band = "under both references"
+            band = "under every reference line"
         elif len(lines) > 1 and self.price_now > lines[-1]["value"]:
-            band = "over both references"
+            band = "over every reference line"
         else:
-            band = "between the two references"
+            band = (f"inside the corridor, {lines[0]['name']} to "
+                    f"{lines[-1]['name']}")
         return {"band": band, "lines": lines, "price": self.price_now,
                 "metric": m}
 
@@ -1426,15 +1531,19 @@ class ValueAnalysis:
         # The 15x yardstick is an earnings convention: fifteen times sales is
         # not a standard anyone uses, so revenue and cash flow leave this
         # part out. A dividend has a real outside reference — the risk-free
-        # rate — and scores against that instead.
-        if self.benchmark_pe and is_yield_metric(self.metric):
+        # rate — and scores against that instead. When the corridor is built
+        # from the stock's OWN percentiles there is nothing here to score:
+        # distance from its own 75th percentile is the history rank again,
+        # and counting it twice would just double the weight of one fact.
+        outside = self.ref_basis == "outside" and self.benchmark_pe
+        if outside and is_yield_metric(self.metric):
             parts["benchmark"] = (
                 f"vs the {self.benchmark_name}",
                 _gap_score(self.benchmark_pe, c),
                 f"yields {mult_text(self.metric, c)} against "
                 f"{mult_text(self.metric, self.benchmark_pe)} on government "
                 f"debt, before any growth")
-        elif self.benchmark_pe and self.metric == "eps":
+        elif outside and self.metric == "eps":
             gap = c / self.benchmark_pe - 1.0
             parts["benchmark"] = (
                 "vs the benchmark", _gap_score(self.benchmark_pe, c),
@@ -1958,6 +2067,11 @@ def analyze(ticker: str, metric: str = "eps", window_years: int = 15,
         in_window = [pe for pe in raw_window if lo <= pe <= hi]
         a.normal_pe = median(in_window)
         a.normal_pe_mean = mean(in_window)
+        # Kept for the corridor built out of the stock's own record, and for
+        # deciding whether the outside yardstick is anywhere near the range
+        # this stock has actually traded in.
+        a.pe_pcts = {q: percentile(in_window, q)
+                     for q in (0.05,) + BAND_PCTS + (0.95,)}
         if in_window and len(in_window) < 24:
             a.warnings.append(
                 f"The normal multiple rests on only {len(in_window)} monthly "
@@ -2010,6 +2124,13 @@ def analyze(ticker: str, metric: str = "eps", window_years: int = 15,
                 "The 10-year Treasury yield could not be fetched, so this "
                 "chart has no outside reference — only the stock's own "
                 "normal yield.")
+
+    # Whatever the outside yardstick came out as, it is now one of two
+    # corridors the chart can be drawn against. The other is built out of
+    # this stock's own record, and Auto decides which one is worth drawing.
+    a.outside_pe, a.outside_name = a.benchmark_pe, a.benchmark_name
+    a.outside_rule = a.benchmark_rule
+    a.set_reference("auto")
 
     # ── 6. yield and payout ──────────────────
     a.ttm_value = _ttm_metric(a)
@@ -2368,6 +2489,43 @@ def _currency_lines(a: ValueAnalysis) -> List[str]:
             f"in {a.price_currency} — converted at each fiscal year end"]
 
 
+def _reference_lines(a: ValueAnalysis) -> List[str]:
+    """What the corridor is measured against, and why that one. The choice
+    moves every coloured band on the chart, so it is stated rather than left
+    for the reader to infer from two numbers."""
+    out = []
+    pc_lo, pc_hi = (int(q * 100) for q in BAND_PCTS)
+    if is_yield_metric(a.metric):
+        # The corridor is built in multiple space, where the LOW multiple is
+        # the HIGH yield. The panel speaks in yields, so the percentile has
+        # to be quoted in yields too or it reads upside down.
+        pc_lo, pc_hi = pc_hi, pc_lo
+    if a.ref_basis == "own" and a.band_lo_pe:
+        for pe, name, pc in ((a.band_lo_pe, a.band_lo_name, pc_lo),
+                             (a.benchmark_pe, a.benchmark_name, pc_hi)):
+            out.append(f"{name:<25}{mult_text(a.metric, pe)}   "
+                       f"corridor edge — this stock's own {pc}th percentile")
+    else:
+        out.append(
+            f"{(a.benchmark_name if is_yield_metric(a.metric) else 'Benchmark multiple'):<25}"
+            f"{mult_text(a.metric, a.benchmark_pe)}   {a.benchmark_rule}")
+    if a.ref_basis == "own":
+        out.append(f"Reference basis          this stock's own record "
+                   f"({min(pc_lo, pc_hi)}th-{max(pc_lo, pc_hi)}th "
+                   f"percentile)")
+    elif a.outside_pe:
+        out.append(f"Reference basis          outside yardstick "
+                   f"({mult_text(a.metric, a.outside_pe)})")
+    if a.ref_reason:
+        out.append(f"  {'why' :<22} {a.ref_reason}")
+    if a.ref_basis == "own" and a.outside_pe:
+        up = a.upside_to(a.outside_pe, date.today())
+        out.append(f"  {'the outside one was':<22} "
+                   f"{mult_text(a.metric, a.outside_pe)}"
+                   + ("" if up is None else f", {up:+.0%} from here"))
+    return out
+
+
 def _meter_lines(a: ValueAnalysis) -> List[str]:
     m = a.value_meter()
     if m["score"] is None:
@@ -2405,8 +2563,7 @@ def _render_summary(a: ValueAnalysis) -> str:
            f"{'Normal yield' if is_yield_metric(a.metric) else 'Normal multiple':<25}"
            f"{mult_text(a.metric, a.normal_pe)}   "
            f"(median monthly, {a.window_years}yr window)",
-           f"{(a.benchmark_name if is_yield_metric(a.metric) else 'Benchmark multiple'):<25}"
-           f"{mult_text(a.metric, a.benchmark_pe)}   {a.benchmark_rule}",
+           ] + _reference_lines(a) + [
            "",
            f"Growth                   {_pct(a.growth_rate)}/yr over "
            f"{span:.0f} years ({len(a.fiscal_dates)} fiscal years)",
@@ -2428,16 +2585,19 @@ def _render_summary(a: ValueAnalysis) -> str:
         out.append(f"  The {a.ticker} price of {_money(z['price'])} is "
                    f"{z['band']}.")
         for ln in z["lines"]:
-            side = "below" if ln["gap"] > 0 else "above"
+            # Measured from the price, which is where the money is: the line
+            # is N% above the price, not the price N% below the line. Those
+            # are different numbers and only one of them is the return.
+            side = "above" if ln["gap"] > 0 else "below"
             out.append(
                 f"    {ln['name']} {mult_text(a.metric, ln['multiple'])} puts "
-                f"the line at {_money(ln['value'])} — price is "
-                f"{abs(ln['gap']):.0%} {side} it")
+                f"the line at {_money(ln['value'])} — "
+                f"{abs(ln['gap']):.0%} {side} the price")
         if is_yield_metric(a.metric):
             out.append(f"  Each line is the price at which the blended "
                        f"dividend of {_money(z['metric'])} would yield that.")
         else:
-            out.append(f"  Both lines are that multiple times the blended "
+            out.append(f"  Every line is that multiple times the blended "
                        f"{METRIC_LABELS.get(a.metric, a.metric)} of "
                        f"{_money(z['metric'])}.")
         out.append("")
@@ -2446,8 +2606,8 @@ def _render_summary(a: ValueAnalysis) -> str:
     out.append("  (at the current multiple this is the price itself, by "
                "definition — that row is left out)")
     today = date.today()
-    for name, mult in (("at normal multiple", a.normal_pe),
-                       ("at benchmark", a.benchmark_pe)):
+    for mult, ref_name in a.references():
+        name = f"at {ref_name}"
         fv, up = a.fair_value(mult, today), a.upside_to(mult, today)
         out.append(f"  {name:<22} {_money(fv):>12}   "
                    f"{'' if up is None else f'{up:+.1%} vs price'}")
@@ -2459,9 +2619,8 @@ def _render_summary(a: ValueAnalysis) -> str:
         out += ["",
                 f"FORECAST TOTAL RETURN to {a.forecast_dates[-1]} "
                 f"({a.forecast_basis} basis)"]
-        for name, mult in (("at normal multiple", a.normal_pe),
-                           (f"at {a.benchmark_name}", a.benchmark_pe),
-                           ("at current multiple", a.current_pe)):
+        for name, mult in ([(f"at {n}", m) for m, n in a.references()]
+                           + [("at current multiple", a.current_pe)]):
             r = a.total_return(mult)
             if not r or r["annualised"] is None:
                 continue
